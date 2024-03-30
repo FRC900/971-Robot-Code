@@ -112,17 +112,18 @@ static size_t DeviceScanInclusiveScanByKeyScratchSpace(size_t elements) {
 
 }  // namespace
 
-GpuDetector::GpuDetector(size_t width, size_t height,
+template <size_t BYTES_PER_PIXEL>
+GpuDetector<BYTES_PER_PIXEL>::GpuDetector(size_t width, size_t height,
                          apriltag_detector_t *tag_detector,
                          CameraMatrix camera_matrix,
                          DistCoeffs distortion_coefficients)
     : width_(width),
       height_(height),
       tag_detector_(tag_detector),
-      color_image_host_(width * height * 2),
+      // color_image_host_(width * height * 2),
       gray_image_host_(width * height),
-      color_image_device_(width * height * 2),
-      gray_image_device_(width * height),
+      color_image_device_(width * height * BYTES_PER_PIXEL),
+      // gray_image_device_(width * height),
       decimated_image_device_(width / 2 * height / 2),
       unfiltered_minmax_image_device_((width / 2 / 4 * height / 2 / 4) * 2),
       minmax_image_device_((width / 2 / 4 * height / 2 / 4) * 2),
@@ -195,7 +196,8 @@ GpuDetector::GpuDetector(size_t width, size_t height,
   zarray_ensure_capacity(detections_, kMaxBlobs);
 }
 
-GpuDetector::~GpuDetector() {
+template <size_t BYTES_PER_PIXEL>
+GpuDetector<BYTES_PER_PIXEL>::~GpuDetector() {
   for (int i = 0; i < zarray_size(detections_); ++i) {
     apriltag_detection_t *det;
     zarray_get(detections_, i, &det);
@@ -718,7 +720,8 @@ struct MergePeakExtents {
 
 }  // namespace
 
-void GpuDetector::Detect(const uint8_t *image) {
+template <size_t BYTES_PER_PIXEL>
+void GpuDetector<BYTES_PER_PIXEL>::Detect(const uint8_t *image) {
   const aos::monotonic_clock::time_point start_time =
       aos::monotonic_clock::now();
   start_.Record(&stream_);
@@ -726,14 +729,12 @@ void GpuDetector::Detect(const uint8_t *image) {
   after_image_memcpy_to_device_.Record(&stream_);
 
   // Threshold the image.
-  CudaToGreyscaleAndDecimateHalide(
-      color_image_device_.get(), gray_image_device_.get(),
+  CudaToGreyscaleAndDecimateHalide<BYTES_PER_PIXEL>(
+      color_image_device_.get(), 
       decimated_image_device_.get(), unfiltered_minmax_image_device_.get(),
       minmax_image_device_.get(), thresholded_image_device_.get(), width_,
       height_, tag_detector_->qtp.min_white_black_diff, &stream_);
   after_threshold_.Record(&stream_);
-
-  gray_image_device_.MemcpyAsyncTo(&gray_image_host_, &stream_);
 
   after_memcpy_gray_.Record(&stream_);
 

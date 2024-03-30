@@ -74,7 +74,14 @@ struct DistCoeffs {
   double k3;
 };
 
+// Undistort pixels based on our camera model, using iterative algorithm
+// Returns false if we fail to converge
+bool UnDistort(double *u, double *v, const CameraMatrix *camera_matrix,
+               const DistCoeffs *distortion_coefficients);
+
+
 // GPU based april tag detector.
+template <size_t BYTES_PER_PIXEl = 2>
 class GpuDetector {
  public:
   // The number of blobs we will consider when counting april tags.
@@ -94,9 +101,9 @@ class GpuDetector {
   const zarray_t *Detections() const { return detections_; }
 
   // Debug methods to expose internal state for testing.
-  void CopyGrayTo(uint8_t *output) const {
-    gray_image_device_.MemcpyTo(output);
-  }
+  // void CopyGrayTo(uint8_t *output) const {
+  //   gray_image_device_.MemcpyTo(output);
+  // }
   void CopyDecimatedTo(uint8_t *output) const {
     decimated_image_device_.MemcpyTo(output);
   }
@@ -193,11 +200,6 @@ class GpuDetector {
     distortion_coefficients_ = distortion_coefficients;
   }
 
-  // Undistort pixels based on our camera model, using iterative algorithm
-  // Returns false if we fail to converge
-  static bool UnDistort(double *u, double *v, const CameraMatrix *camera_matrix,
-                        const DistCoeffs *distortion_coefficients);
-
  private:
   void UpdateFitQuads();
 
@@ -264,13 +266,13 @@ class GpuDetector {
   CudaEvent after_quad_fit_memcpy_;
 
   // TODO(austin): Remove this...
-  HostMemory<uint8_t> color_image_host_;
+  // HostMemory<uint8_t> color_image_host_;
   HostMemory<uint8_t> gray_image_host_;
 
   // Starting color image.
   GpuMemory<uint8_t> color_image_device_;
   // Full size gray scale image.
-  GpuMemory<uint8_t> gray_image_device_;
+  // GpuMemory<uint8_t> gray_image_device_;
   // Half resolution, gray, decimated image.
   GpuMemory<uint8_t> decimated_image_device_;
   // Intermediates for thresholding.
