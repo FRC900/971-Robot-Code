@@ -759,27 +759,38 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   const aos::monotonic_clock::time_point start_time =
       aos::monotonic_clock::now();
   start_.Record(&stream_);
+  event_timings_.start("image_memcpy_to_device", stream_.get());
   color_image_device_.MemcpyAsyncFrom(image, input_size_, &stream_);
+  event_timings_.end("image_memcpy_to_device");
   after_image_memcpy_to_device_.Record(&stream_);
 
   // Threshold the image.
+  event_timings_.start("CudaToGreyscaleAndDecimateHalide", stream_.get());
   CudaToGreyscaleAndDecimateHalide<INPUT_FORMAT>(
       color_image_device_.get(), gray_image_device_.get(),
       decimated_image_device_.get(), unfiltered_minmax_image_device_.get(),
       minmax_image_device_.get(), thresholded_image_device_.get(), width_,
       height_, tag_detector_->qtp.min_white_black_diff, &stream_);
+  event_timings_.end("CudaToGreyscaleAndDecimateHalide");
   after_threshold_.Record(&stream_);
+  event_timings_.start("gray_image_memcpy_to_host", stream_.get());
+  // TODO : maybe run me on separate stream
   gray_image_device_.MemcpyAsyncTo(&gray_image_host_, &stream_);
+  event_timings_.end("gray_image_memcpy_to_host");
 
   after_memcpy_gray_.Record(&stream_);
 
+  event_timings_.start("union_markers_size_devize_memset", stream_.get());
   union_markers_size_device_.MemsetAsync(0u, &stream_);
+  event_timings_.end("union_markers_size_devize_memset");
   after_memset_.Record(&stream_);
 
   // Unionfind the image.
+  event_timings_.start("LabelImage", stream_.get());
   LabelImage(ToGpuImage(thresholded_image_device_),
              ToGpuImage(union_markers_device_),
              ToGpuImage(union_markers_size_device_), stream_.get());
+  event_timings_.end("LabelImage");
 
   after_unionfinding_.Record(&stream_);
 
@@ -795,6 +806,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   // Compute the unfiltered list of blob pairs and points.
   {
+    ScopedEventTiming t(event_timings_, "BlobDiff", stream_.get());
     constexpr size_t kBlockWidth = 32;
     constexpr size_t kBlockHeight = 16;
     dim3 threads(kBlockWidth, kBlockHeight, 1);
@@ -818,6 +830,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   after_diff_.Record(&stream_);
 
   {
+    ScopedEventTiming t(event_timings_, "cub::DeviceSelect::If", stream_.get());
     // Remove empty points which aren't to be considered before sorting to speed
     // things up.
     size_t temp_storage_bytes =
@@ -837,6 +850,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   int num_compressed_union_marker_pair_host;
   {
+    ScopedEventTiming t(event_timings_, "ub::DeviceRadixSort::SortKeys", stream_.get());
     num_compressed_union_marker_pair_device_.MemcpyTo(
         &num_compressed_union_marker_pair_host);
     CHECK_LT(static_cast<size_t>(num_compressed_union_marker_pair_host),
@@ -860,6 +874,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   size_t num_quads_host = 0;
   {
+    event_timings_.start("cub::TransformQuadBoundary", stream_.get());
     // Our next step is to compute the extents and dot product so we can filter
     // blobs.
     cub::ArgIndexInputIterator<QuadBoundaryPoint *> value_index_input_iterator(
@@ -872,12 +887,16 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
     // Don't care about the output keys...
     cub::DiscardOutputIterator<uint64_t> key_discard_iterator;
+    event_timings_.end("cub::TransformQuadBoundary");
 
     // Provide a mask to detect keys by rep01()
+    event_timings_.start("cub::TransformQuadBoundaryMask", stream_.get());
     MaskRep01 mask;
     cub::TransformInputIterator<uint64_t, MaskRep01, QuadBoundaryPoint *>
         key_input_iterator(sorted_union_marker_pair_device_.get(), mask);
+    event_timings_.end("cub::TransformQuadBoundaryMask");
 
+    event_timings_.start("cub::DeviceReduce", stream_.get());
     // Reduction operator.
     QuadBoundaryPointExtents reduce;
 
@@ -889,8 +908,11 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
         extents_device_.get(), num_quads_device_.get(), reduce,
         num_compressed_union_marker_pair_host, stream_.get());
     after_bounds_.Record(&stream_);
+    event_timings_.end("cub::DeviceReduce");
 
+    event_timings_.start("num_quads_memcpy_d2h", stream_.get());
     num_quads_device_.MemcpyTo(&num_quads_host);
+    event_timings_.end("num_quads_memcpy_d2h");
   }
 
   // Longest april tag will be the full perimeter of the image.  Each point
@@ -903,6 +925,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   const size_t max_april_tag_perimeter = 2 * (width_ + height_);
 
   {
+    event_timings_.start("cub::TransformMinMaxExtents", stream_.get());
     // Now that we have the dot products, we need to rewrite the extents for the
     // post-thresholded world so we can find the start and end address of blobs
     // for fitting lines.
@@ -918,6 +941,9 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
                                 TransformZeroFilteredBlobSizes,
                                 cub::ArgIndexInputIterator<MinMaxExtents *>>
         input_iterator(value_index_input_iterator, rewrite);
+    event_timings_.end("cub::TransformMinMaxExtents");
+
+    event_timings_.start("cub::DeviceScan::InclusiveScan", stream_.get());
 
     // Sum the counts of everything before us, and update the offset.
     SumPoints sum_points;
@@ -934,12 +960,14 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
         num_quads_host));
 
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScan");
+    event_timings_.end("cub::DeviceScan::InclusiveScan");
   }
 
   after_transform_extents_.Record(&stream_);
 
   int num_selected_blobs_host;
   {
+    event_timings_.start("cub::TransformIndexPoint", stream_.get());
     // Now, copy over all points which pass our thresholds.
     cub::ArgIndexInputIterator<QuadBoundaryPoint *> value_index_input_iterator(
         sorted_union_marker_pair_device_.get());
@@ -948,12 +976,16 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
     cub::TransformInputIterator<IndexPoint, RewriteToIndexPoint,
                                 cub::ArgIndexInputIterator<QuadBoundaryPoint *>>
         input_iterator(value_index_input_iterator, rewrite);
+    event_timings_.end("cub::TransformIndexPoint");
 
+    event_timings_.start("TransformOutputIndexPoint", stream_.get());
     AddThetaToIndexPoint add_theta(extents_device_.get(), num_quads_host);
 
     TransformOutputIterator<IndexPoint, IndexPoint, AddThetaToIndexPoint>
         output_iterator(selected_blobs_device_.get(), add_theta);
+    event_timings_.end("TransformOutputIndexPoint");
 
+    event_timings_.start("cub::DeviceSelect::IfBlobs", stream_.get());
     NonzeroBlobs select_blobs(selected_extents_device_.get());
 
     size_t temp_storage_bytes =
@@ -964,16 +996,20 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
         temp_storage_bytes, input_iterator, output_iterator,
         num_selected_blobs_device_.get(), num_compressed_union_marker_pair_host,
         select_blobs, stream_.get()));
+    event_timings_.end("cub::DeviceSelect::IfBlobs");
 
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
 
+    event_timings_.start("num_selected_blobs_memcpy_d2h", stream_.get());
     num_selected_blobs_device_.MemcpyAsyncTo(&num_selected_blobs_host,
                                              &stream_);
     after_filter_.Record(&stream_);
     after_filter_.Synchronize();
+    event_timings_.end("num_selected_blobs_memcpy_d2h");
   }
 
   {
+  ScopedEventTiming t(event_timings_, "cub::DeviceRadixSort::SortKeysBlobs", stream_.get());
     // Sort based on the angle.
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     QuadIndexPointDecomposer decomposer;
@@ -990,6 +1026,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   after_filtered_sort_.Record(&stream_);
 
   {
+    event_timings_.start("cub::TransformLineFitPoint", stream_.get());
     // Now that we have the dot products, we need to rewrite the extents for the
     // post-thresholded world so we can find the start and end address of blobs
     // for fitting lines.
@@ -1001,7 +1038,9 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
     cub::TransformInputIterator<LineFitPoint, TransformLineFitPoint,
                                 IndexPoint *>
         input_iterator(sorted_selected_blobs_device_.get(), rewrite);
+    event_timings_.end("cub::TransformLineFitPoint");
 
+    event_timings_.start("cub::DeviceScan::InclusiveScanByKeyMaskBlob", stream_.get());
     MaskBlobIndex mask;
     cub::TransformInputIterator<uint32_t, MaskBlobIndex, IndexPoint *>
         key_iterator(sorted_selected_blobs_device_.get(), mask);
@@ -1019,10 +1058,12 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
         num_selected_blobs_host));
 
     MaybeCheckAndSynchronize("cub::DeviceScan::InclusiveScanByKey");
+    event_timings_.end("cub::DeviceScan::InclusiveScanByKey");
   }
   after_line_fit_.Record(&stream_);
 
   {
+    ScopedEventTiming t(event_timings_, "FitLines", stream_.get());
     FitLines(line_fit_points_device_.get(), num_selected_blobs_host,
              selected_extents_device_.get(), num_quads_host, errs_device_.get(),
              filtered_errs_device_.get(), filtered_is_local_peak_device_.get(),
@@ -1032,6 +1073,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   int num_compressed_peaks_host;
   {
+    event_timings_.start("cub::DeviceSelect::IfPeaks", stream_.get());
     // Remove empty points which aren't to be considered before sorting to speed
     // things up.
     size_t temp_storage_bytes =
@@ -1045,13 +1087,17 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
     after_peak_compression_.Record(&stream_);
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
+    event_timings_.end("cub::DeviceSelect::IfPeaks");
+    event_timings_.start("num_compressed_peaks_memcpy_d2h", stream_.get());
     num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host,
                                                &stream_);
     after_peak_count_memcpy_.Record(&stream_);
     after_peak_count_memcpy_.Synchronize();
+    event_timings_.end("num_compressed_peaks_memcpy_d2h");
   }
 
   {
+    ScopedEventTiming t(event_timings_, "cub::DeviceRadixSort::SortKeysPeaks", stream_.get());
     // Sort based on the angle.
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     PeakDecomposer decomposer;
@@ -1071,6 +1117,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   // Now that we have the peaks sorted, recompute the extents so we can easily
   // pick out the number and top 10 peaks for line fitting.
   {
+    event_timings_.start("cub::TransformPeakExtents", stream_.get());
     // Our next step is to compute the extents of each blob so we can filter
     // blobs.
     cub::ArgIndexInputIterator<Peak *> value_index_input_iterator(
@@ -1082,6 +1129,9 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
     // Don't care about the output keys...
     cub::DiscardOutputIterator<uint32_t> key_discard_iterator;
+    event_timings_.end("cub::TransformPeakExtents");
+
+    event_timings_.start("cub::DeviceReduce::ReduceByKeyPeakExtents", stream_.get());
 
     // Provide a mask to detect keys by rep01()
     MaskPeakExtentsByBlobId mask;
@@ -1101,15 +1151,19 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
     MaybeCheckAndSynchronize("cub::DeviceReduce::ReduceByKey");
 
     after_filtered_peak_reduce_.Record(&stream_);
+    event_timings_.end("cub::DeviceReduce::ReduceByKeyPeakExtents");
 
+    event_timings_.start("num_quad_peaked_quads_memcpy_d2h", stream_.get());
     num_quad_peaked_quads_device_.MemcpyAsyncTo(&num_quad_peaked_quads_host,
                                                 &stream_);
     MaybeCheckAndSynchronize("num_quad_peaked_quads_device_.MemcpyTo");
     after_filtered_peak_host_memcpy_.Record(&stream_);
     after_filtered_peak_host_memcpy_.Synchronize();
+    event_timings_.end("num_quad_peaked_quads_memcpy_d2h");
   }
 
   {
+    ScopedEventTiming t(event_timings_, "FitQuads", stream_.get());
     apriltag::FitQuads(
         sorted_compressed_peaks_device_.get(), num_compressed_peaks_host,
         peak_extents_device_.get(), num_quad_peaked_quads_host,
@@ -1121,6 +1175,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   after_quad_fit_.Record(&stream_);
 
   {
+    ScopedEventTiming t(event_timings_, "MemcpyFitQuads", stream_.get());
     fit_quads_host_.resize(num_quad_peaked_quads_host);
     fit_quads_device_.MemcpyAsyncTo(fit_quads_host_.data(),
                                     num_quad_peaked_quads_host, &stream_);
@@ -1130,10 +1185,16 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   const aos::monotonic_clock::time_point before_fit_quads =
       aos::monotonic_clock::now();
+  event_timings_.start("UpdateFitQuads", stream_.get());
   UpdateFitQuads();
+  event_timings_.end("UpdateFitQuads");
+  event_timings_.start("AdjustPixelCenters", stream_.get());
   AdjustPixelCenters();
+  event_timings_.end("AdjustPixelCenters");
 
+  event_timings_.start("DecodeTags", stream_.get());
   DecodeTags();
+  event_timings_.end("DecodeTags");
 
   const aos::monotonic_clock::time_point end_time = aos::monotonic_clock::now();
 
