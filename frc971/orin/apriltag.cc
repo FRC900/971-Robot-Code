@@ -793,6 +793,10 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   after_memcpy_gray_.Record(&stream_);
 
+  // TODO : run on a separate stream, experiment with where to launch it
+  //        so that it is finished by the time it is needed in LabelImage() below
+  //        This will require Wait() on the after_memset_ event on the main stream
+  //        before the data is used in LabelImage()
   event_timings_.start("union_markers_size_devize_memset", stream_.get());
   union_markers_size_device_.MemsetAsync(0u, &stream_);
   event_timings_.end("union_markers_size_devize_memset");
