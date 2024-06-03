@@ -1,3 +1,4 @@
+#include "ros/console.h"
 #include "frc971/orin/apriltag.h"
 
 #include <thrust/iterator/constant_iterator.h>
@@ -366,7 +367,7 @@ __global__ void BlobDiff(const uint8_t *thresholded_image,
   DO_CONN(1, 0, 0);
   DO_CONN(1, 1, 1);
   DO_CONN(0, 1, 2);
-  const uint64_t rep_block_2 = rep1;
+  const uint64_t rep_block_2 = rep1; // TODO - see if this should be uint32_t instead
   const uint8_t v1_block_2 = v1;
 
   const uint left_thread_linear_index1 =
@@ -849,6 +850,28 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
   // TODO - allocate this as HostMemory so we can do async copies of it
   //        Same for all subsquent uses of this pattern
   int num_compressed_union_marker_pair_host;
+  // TODO - As an experiment, don't try to reduce the number of pairs
+  //        before sorting. Instead, mark each invalid point with a value
+  //        such that it will be sorted to the end of the list.  Keep track of the
+  //        number of valid pairs when marking the points invalid so that count
+  //        can be used in subsequent steps to ignore the invalid points.
+  //        Doing a parallel reduce of the number of valid entries might not
+  //        be that much faster than doing the If, but maybe there's some gains
+  //        to be had by submitting the Subsequent RadixSort immediately rather
+  //        than waiting to get num_compressed_union_marker_pair_host back from the
+  //        gpu onto the cpu?
+  //        The count could be calulated using an inclusive scan, with the input iterator
+  //        being something like nonzero() ?  1: 0 or similar.  There would need to be an extra
+  //        device array for the result of this, and then the count of non-zero items
+  //        would be the last element of the array. That would need to be copied back to the host
+  //        for use in subsequent steps ... but not the radix sort, since that could be run
+  //        using the full union markers count. The quesiton is whether the sort
+  //        on a longer array would be faster than the If() call below plus the time
+  //        to get data back from it and into the SortKeys submit.  And the two
+  //        can likely be run in different streams for some more benefit?
+  //        
+  //        Should be a "simple" change to QuadBoundaryPoint operator< to make
+  //        zero value always return false in the SortKeys call below?
   {
     event_timings_.start("IfUnionMarkerPair", stream_.get());
     // Remove empty points which aren't to be considered before sorting to speed
@@ -873,6 +896,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
     // not having an implicit sync.
     num_compressed_union_marker_pair_device_.MemcpyTo(
         &num_compressed_union_marker_pair_host);
+    ROS_INFO_STREAM_THROTTLE(1, "num_compressed_union_marker_pair_host: " << num_compressed_union_marker_pair_host);
     event_timings_.end("num_compressed_union_marker_pair_memcpy_d2h");
   }
 
@@ -940,6 +964,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
     // the record and sync, but there's occasionally speedups to be had by
     // not having an implicit sync.
     num_quads_device_.MemcpyTo(&num_quads_host);
+    ROS_INFO_STREAM_THROTTLE(1., "num_quads_host: " << num_quads_host);
     event_timings_.end("num_quads_memcpy_d2h");
   }
 
@@ -1025,11 +1050,12 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
                                              &stream_);
     after_filter_.Record(&stream_);
     after_filter_.Synchronize();
+    ROS_INFO_STREAM_THROTTLE(1., "num_selected_blobs_host: " << num_selected_blobs_host);
     event_timings_.end("num_selected_blobs_memcpy_d2h");
   }
 
   {
-    ScopedEventTiming t(event_timings_, "cub::DeviceRadixSort::SortKeysBlobs", stream_.get());
+    ScopedEventTiming t(event_timings_, "SortKeysBlobs", stream_.get());
     // Sort based on the angle.
     size_t temp_storage_bytes = radix_sort_tmpstorage_device_.size();
     QuadIndexPointDecomposer decomposer;
@@ -1089,7 +1115,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
   int num_compressed_peaks_host;
   {
-    event_timings_.start("cub::DeviceSelect::IfPeaks", stream_.get());
+    event_timings_.start("IfPeaks", stream_.get());
     // Remove empty points which aren't to be considered before sorting to speed
     // things up.
     size_t temp_storage_bytes =
@@ -1103,12 +1129,13 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
 
     after_peak_compression_.Record(&stream_);
     MaybeCheckAndSynchronize("cub::DeviceSelect::If");
-    event_timings_.end("cub::DeviceSelect::IfPeaks");
+    event_timings_.end("IfPeaks");
     event_timings_.start("num_compressed_peaks_memcpy_d2h", stream_.get());
     num_compressed_peaks_device_.MemcpyAsyncTo(&num_compressed_peaks_host,
                                                &stream_);
     after_peak_count_memcpy_.Record(&stream_);
     after_peak_count_memcpy_.Synchronize();
+    ROS_INFO_STREAM_THROTTLE(1., "num_compressed_peaks_host: " << num_compressed_peaks_host);
     event_timings_.end("num_compressed_peaks_memcpy_d2h");
   }
 
@@ -1172,6 +1199,7 @@ void GpuDetector<INPUT_FORMAT>::Detect(const uint8_t *image) {
     MaybeCheckAndSynchronize("num_quad_peaked_quads_device_.MemcpyTo");
     after_filtered_peak_host_memcpy_.Record(&stream_);
     after_filtered_peak_host_memcpy_.Synchronize();
+    ROS_INFO_STREAM_THROTTLE(1., "num_quad_peaked_quads_host: " << num_quad_peaked_quads_host);
     event_timings_.end("num_quad_peaked_quads_memcpy_d2h");
   }
 
