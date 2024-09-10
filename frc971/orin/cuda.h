@@ -1,6 +1,13 @@
 #ifndef FRC971_ORIN_CUDA_H_
 #define FRC971_ORIN_CUDA_H_
 
+#ifndef __host__
+#define __host__
+#endif
+#ifndef __device__
+#define __device__
+#endif
+
 #include <chrono>
 #include <gpu_apriltag/span.hpp>
 
@@ -11,7 +18,7 @@
 
 // CHECKs that a cuda method returned success.
 // TODO(austin): This will not handle if and else statements quite right, fix if
-// we care.
+// we care (wrap in a do {} while(0) block).
 #define CHECK_CUDA(condition)                                             \
   if (auto c = condition)                                                 \
   LOG(FATAL) << "Check failed: " #condition " (" << cudaGetErrorString(c) \
@@ -21,6 +28,7 @@ namespace frc971::apriltag {
 
 // Class to manage the lifetime of a Cuda stream.  This is used to provide
 // relative ordering between kernels on the same stream.
+class CudaEvent;
 class CudaStream {
  public:
   CudaStream() { CHECK_CUDA(cudaStreamCreate(&stream_)); }
@@ -34,6 +42,9 @@ class CudaStream {
 
   // Returns the stream.
   cudaStream_t get() { return stream_; }
+
+  // Make this stream wait until the selected event has been triggered
+  void Wait(CudaEvent *event);
 
  private:
   cudaStream_t stream_;
@@ -52,6 +63,8 @@ class CudaEvent {
 
   virtual ~CudaEvent() { CHECK_CUDA(cudaEventDestroy(event_)); }
 
+  cudaEvent_t get() { return event_; }
+
   // Queues up an event to be timestamped on the stream when it is executed.
   void Record(CudaStream *stream) {
     CHECK_CUDA(cudaEventRecord(event_, stream->get()));
@@ -68,9 +81,6 @@ class CudaEvent {
 
   // Waits until the event has been triggered.
   void Synchronize() { CHECK_CUDA(cudaEventSynchronize(event_)); }
-
-  // Make a specific stream wait until the current event has been triggered
-  void Wait(CudaStream *stream) { CHECK_CUDA(cudaStreamWaitEvent(stream->get(), event_, 0)); }
 
  private:
   cudaEvent_t event_;
@@ -105,6 +115,10 @@ class HostMemory {
   void MemcpyFrom(const T *other) {
     memcpy(span_.data(), other, sizeof(T) * size());
   }
+  void MemcpyFrom(const T *other, const size_t size) {
+    memcpy(span_.data(), other, sizeof(T) * size);
+  }
+
   // Copies data to other (host memory) from this's memory.
   void MemcpyTo(const T *other) {
     memcpy(other, span_.data(), sizeof(T) * size());
@@ -127,6 +141,11 @@ class GpuMemory {
     CHECK_CUDA(cudaMemset(memory_, 0, size * sizeof(T)));
   }
   GpuMemory(const GpuMemory &) = delete;
+
+  // Create an alias to an already allocated GPU memory block.
+  // This is useful for cases where operations on memory are a no-op
+  //   for certain input types - for example, for mono input imnages,
+  //   the GPU "color" image is the same as the one converted to grayscale.
   GpuMemory &operator=(const GpuMemory &other) {
     // If we currently own our memory, free it.
     if (owns_memory_) {
@@ -169,6 +188,10 @@ class GpuMemory {
   }
   void MemcpyAsyncFrom(const HostMemory<T> *host_memory, CudaStream *stream) {
     CHECK_CUDA(cudaMemcpyAsync(memory_, host_memory, sizeof(T) * host_memory->size(),
+                               cudaMemcpyHostToDevice, stream->get()));
+  }
+  void MemcpyAsyncFrom(const HostMemory<T> *host_memory, const size_t size, CudaStream *stream) {
+    CHECK_CUDA(cudaMemcpyAsync(memory_, host_memory, sizeof(T) * size,
                                cudaMemcpyHostToDevice, stream->get()));
   }
 
