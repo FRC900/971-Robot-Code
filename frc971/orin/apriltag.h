@@ -107,9 +107,9 @@ class GpuDetector {
   void CopyGrayTo(uint8_t *output) const {
     gray_image_device_.MemcpyTo(output);
   }
-  void CopyDecimatedTo(uint8_t *output) const {
-    decimated_image_device_.MemcpyTo(output);
-  }
+  // void CopyDecimatedTo(uint8_t *output) const {
+  //   decimated_image_device_.MemcpyTo(output);
+  // }
   void CopyThresholdedTo(uint8_t *output) const {
     thresholded_image_device_.MemcpyTo(output);
   }
@@ -235,7 +235,11 @@ class GpuDetector {
   // Size of the image.
   const size_t width_;
   const size_t height_;
-  const size_t input_size_;
+  // Preserve the actual non-rounded-to-power-of-8 input size
+  // Use this for the h2d memcpy of the input image to avoid
+  // copying outsize the bounds of the input image
+  const size_t unrounded_input_height_;
+  const size_t input_size_; // TODO - might be redundant
 
   // Detector parameters.
   apriltag_detector_t *tag_detector_;
@@ -275,19 +279,21 @@ class GpuDetector {
 
   HostMemory<uint8_t> gray_image_host_;
   const uint8_t      *gray_image_host_ptr_;
-  HostMemory<int>     num_compressed_union_marker_pair_host_;
-  HostMemory<size_t>  num_quads_host_;
-  HostMemory<int>     num_selected_blobs_host_;
-  HostMemory<int>     num_compressed_peaks_host_;
-  HostMemory<int>     num_quad_peaked_quads_host_;
 
+  // 1-element cariable holding the host version of results from
+  // intermediate steps
+  HostMemory<int>     num_compressed_union_marker_pair_host_{1, 1};
+  HostMemory<size_t>  num_quads_host_{1, 1};
+  HostMemory<int>     num_selected_blobs_host_{1, 1};
+  HostMemory<int>     num_compressed_peaks_host_{1, 1};
+  HostMemory<int>     num_quad_peaked_quads_host_{1, 1};
 
   // Starting color image.
-  GpuMemory<uint8_t> color_image_device_;
+  GpuMemoryPitched<uint8_t> color_image_device_;
   // Full size gray scale image.
   GpuMemory<uint8_t> gray_image_device_;
   // Half resolution, gray, decimated image.
-  GpuMemory<uint8_t> decimated_image_device_;
+  GpuMemoryPitched<uint8_t> decimated_image_device_;
   // Intermediates for thresholding.
   GpuMemory<uint8_t> unfiltered_minmax_image_device_;
   GpuMemory<uint8_t> minmax_image_device_;

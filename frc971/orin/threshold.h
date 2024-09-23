@@ -17,7 +17,8 @@ void CudaToGreyscale(const uint8_t *color_image, uint8_t *gray_image,
 // stream.
 template <InputFormat INPUT_FORMAT>
 void CudaToGreyscaleAndDecimateHalide(
-    const uint8_t *color_image, uint8_t *gray_image, uint8_t *decimated_image,
+    const GpuMemoryPitched<uint8_t> &color_image,
+    GpuMemoryPitched<uint8_t> &decimated_image,
     uint8_t *unfiltered_minmax_image, uint8_t *minmax_image,
     uint8_t *thresholded_image, uint32_t width, uint32_t height,
     uint32_t min_white_black_diff, CudaStream *stream);

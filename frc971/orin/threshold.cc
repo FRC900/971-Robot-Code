@@ -29,10 +29,13 @@ namespace {
 // 1456 -> 2 * 8 * 7 * 13
 // 1088 -> 2 * 32 * 17
 
+// 1600 -> 5 * 5 * 64
+// 1300 -> 5 * 5 * 4 * 13
+
 // Convert from input format to grayscale.
 template <InputFormat INPUT_FORMAT>
-__global__ void InternalCudaToGreyscale(const uint8_t *color_image,
-                                        uint8_t *gray_image, uint32_t width,
+__global__ void InternalCudaToGreyscale(const uint8_t * __restrict__ color_image,
+                                        uint8_t * __restrict__ gray_image, uint32_t width,
                                         uint32_t height) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   while (i < width * height) {
@@ -58,10 +61,10 @@ __global__ void InternalCudaToGreyscale(const uint8_t *color_image,
 // Writes out the grayscale image and decimated image.
 template <InputFormat INPUT_FORMAT>
 __global__ void InternalCudaToGreyscaleAndDecimateHalide(
-    const uint8_t *color_image, uint8_t *decimated_image,
-    const uint32_t in_width, const uint32_t in_height) {
-  const uint32_t out_height = in_height / 2;
-  const uint32_t out_width = in_width / 2;
+    const uint8_t *__restrict__ color_image, const uint32_t in_pitch,
+    uint8_t *__restrict__ decimated_image,
+    const uint32_t out_width, const uint32_t out_height, const uint32_t out_pitch) {
+
   uint32_t out_i = blockIdx.x * blockDim.x + threadIdx.x;
 
   while (out_i < out_width * out_height) {
@@ -72,7 +75,7 @@ __global__ void InternalCudaToGreyscaleAndDecimateHalide(
     const u_int32_t in_row = out_row * 2;
     const u_int32_t in_col = out_col * 2;
 
-    const uint32_t in_i = in_row * in_width + in_col;
+    const uint32_t in_i = in_row * in_pitch + in_col;
 
     if constexpr (INPUT_FORMAT == InputFormat::Mono8) {
       pixel = color_image[in_i];
@@ -89,7 +92,7 @@ __global__ void InternalCudaToGreyscaleAndDecimateHalide(
     }
 
 
-    decimated_image[out_row * out_width + out_col] = pixel;
+    decimated_image[out_row * out_pitch + out_col] = pixel;
     out_i += blockDim.x * gridDim.x;
   }
   // TODO(austin): Figure out how to load contiguous memory reasonably
@@ -103,25 +106,28 @@ __global__ void InternalCudaToGreyscaleAndDecimateHalide(
 }
 
 // Returns the min and max for a row of 4 pixels.
-__forceinline__ __device__ uchar2 minmax(uchar4 row) {
+__forceinline__ __device__ uchar2 minmax(const uchar4 &row) {
   uint8_t min_val = std::min(std::min(row.x, row.y), std::min(row.z, row.w));
   uint8_t max_val = std::max(std::max(row.x, row.y), std::max(row.z, row.w));
   return make_uchar2(min_val, max_val);
 }
 
 // Returns the min and max for a set of min and maxes.
-__forceinline__ __device__ uchar2 minmax(uchar2 val0, uchar2 val1) {
+__forceinline__ __device__ uchar2 minmax(const uchar2 &val0, const uchar2 &val1) {
   return make_uchar2(std::min(val0.x, val1.x), std::max(val0.y, val1.y));
 }
 
 // Returns the pixel index of a pixel at the provided x and y location.
-__forceinline__ __device__ uint32_t XYToIndex(uint32_t width, uint32_t x, uint32_t y) {
+__forceinline__ __device__ uint32_t XYToIndex(const uint32_t width,
+                                              const uint32_t x,
+                                              const uint32_t y) {
   return width * y + x;
 }
 
 // Computes the min and max pixel value for each block of 4 pixels.
-__global__ void InternalBlockMinMax(const uint8_t *decimated_image,
-                                    uchar2 *unfiltered_minmax_image,
+__global__ void InternalBlockMinMax(const uint8_t * __restrict__ decimated_image,
+                                    const uint32_t decimated_pitch,
+                                    uchar2 * __restrict__ unfiltered_minmax_image,
                                     const uint32_t width, const uint32_t height) {
   uchar2 vals[4];
   const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -133,7 +139,7 @@ __global__ void InternalBlockMinMax(const uint8_t *decimated_image,
 
   for (int i = 0; i < 4; ++i) {
     const uchar4 decimated_block = *reinterpret_cast<const uchar4 *>(
-        decimated_image + XYToIndex(width * 4, x * 4, y * 4 + i));
+        decimated_image + XYToIndex(decimated_pitch, x * 4, y * 4 + i));
 
     vals[i] = minmax(decimated_block);
   }
@@ -144,8 +150,8 @@ __global__ void InternalBlockMinMax(const uint8_t *decimated_image,
 
 // Filters the min/max for the surrounding block of 9 pixels centered on our
 // location using min/max and writes the result back out.
-__global__ void InternalBlockFilter(const uchar2 *unfiltered_minmax_image,
-                                    uchar2 *minmax_image, const uint32_t width,
+__global__ void InternalBlockFilter(const uchar2 * __restrict__ unfiltered_minmax_image,
+                                    uchar2 * __restrict__ minmax_image, const uint32_t width,
                                     const uint32_t height) {
   uchar2 result = make_uchar2(255, 0);
 
@@ -181,9 +187,10 @@ __global__ void InternalBlockFilter(const uchar2 *unfiltered_minmax_image,
 }
 
 // Thresholds the image based on the filtered thresholds.
-__global__ void InternalThreshold(const uint8_t *decimated_image,
-                                  const uchar2 *minmax_image,
-                                  uint8_t *thresholded_image, const uint32_t width,
+__global__ void InternalThreshold(const uint8_t * __restrict__ decimated_image,
+                                  const uint32_t decimated_pitch,
+                                  const uchar2 * __restrict__ minmax_image,
+                                  uint8_t * __restrict__ thresholded_image, const uint32_t width,
                                   const uint32_t height, const uint32_t min_white_black_diff) {
   uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
   while (i < width * height) {
@@ -196,8 +203,8 @@ __global__ void InternalThreshold(const uint8_t *decimated_image,
     if (minmax_val.y - minmax_val.x < min_white_black_diff) {
       result = 127;
     } else {
-      uint8_t thresh = minmax_val.x + (minmax_val.y - minmax_val.x) / 2;
-      if (decimated_image[i] > thresh) {
+      const uint8_t thresh = minmax_val.x + (minmax_val.y - minmax_val.x) / 2;
+      if (decimated_image[y * decimated_pitch + x] > thresh) {
         result = 255;
       } else {
         result = 0;
@@ -228,7 +235,7 @@ void CudaToGreyscale(const uint8_t *color_image, uint8_t *gray_image,
 
 template <InputFormat INPUT_FORMAT>
 void CudaToGreyscaleAndDecimateHalide(
-    const uint8_t *color_image, uint8_t *gray_image, uint8_t *decimated_image,
+    const GpuMemoryPitched<uint8_t> &color_image, GpuMemoryPitched<uint8_t> &decimated_image,
     uint8_t *unfiltered_minmax_image, uint8_t *minmax_image,
     uint8_t *thresholded_image, uint32_t width, uint32_t height,
     uint32_t min_white_black_diff, CudaStream *stream) {
@@ -240,27 +247,13 @@ void CudaToGreyscaleAndDecimateHalide(
 
   {
     // Step one, convert to gray and decimate.
-    size_t kBlocks = (decimated_width * decimated_height + kThreads - 1) / kThreads / 4;
-    // GpuMemory<uint8_t> decimated_image_device_2(decimated_width * decimated_height);  // temp debug
-    InternalCudaToGreyscaleAndDecimateHalide<INPUT_FORMAT><<<kBlocks, kThreads, 0,
-                                               stream->get()>>>(
-        color_image, decimated_image, width, height);
+    const size_t kBlocks = (decimated_width * decimated_height + kThreads - 1) / kThreads / 4;
+    InternalCudaToGreyscaleAndDecimateHalide<INPUT_FORMAT>
+        <<<kBlocks, kThreads, 0, stream->get()>>>(
+            color_image.get(), color_image.pitchBytes(),
+            decimated_image.get(),
+            decimated_image.widthElements(), decimated_image.heightElements(), decimated_image.pitchBytes());
     MaybeCheckAndSynchronize();
-
-#if 0
-    HostMemory<uint8_t> decimated_image_host (decimated_width * decimated_height);
-    HostMemory<uint8_t> decimated_image_host_2 (decimated_width * decimated_height);
-    CHECK_CUDA(cudaMemcpy(
-        reinterpret_cast<void *>(decimated_image_host.get()), decimated_image,
-        sizeof(uint8_t) * decimated_width * decimated_height,
-        cudaMemcpyDeviceToHost));
-    decimated_image_device_2.MemcpyTo(&decimated_image_host_2);
-    for (size_t i = 0; i < decimated_width * decimated_height; i++) {
-      if (std::abs(static_cast<int>(decimated_image_host.get()[i]) - decimated_image_host_2.get()[i]) > 1)
-        ROS_ERROR_STREAM("Decimated image mismatch at " << i << " " << decimated_image_host.get()[i] << " " << decimated_image_host_2.get()[i]);
-    } 
-    ROS_ERROR_STREAM("Decimated image matches");
-#endif
   }
 
   {
@@ -270,7 +263,8 @@ void CudaToGreyscaleAndDecimateHalide(
                 (decimated_height / 4 + 15) / 16, 1);
 
     InternalBlockMinMax<<<blocks, threads, 0, stream->get()>>>(
-        decimated_image, reinterpret_cast<uchar2 *>(unfiltered_minmax_image),
+        decimated_image.get(), decimated_image.pitchBytes(), 
+        reinterpret_cast<uchar2 *>(unfiltered_minmax_image),
         decimated_width / 4, decimated_height / 4);
     MaybeCheckAndSynchronize();
 
@@ -288,7 +282,8 @@ void CudaToGreyscaleAndDecimateHalide(
     // if the pixels are above or below the average of the min/max.
     const uint32_t kBlocks = (width * height / 4 + kThreads - 1) / kThreads / 4;
     InternalThreshold<<<kBlocks, kThreads, 0, stream->get()>>>(
-        decimated_image, reinterpret_cast<uchar2 *>(minmax_image),
+        decimated_image.get(), decimated_image.pitchBytes(),
+        reinterpret_cast<uchar2 *>(minmax_image),
         thresholded_image, decimated_width, decimated_height,
         min_white_black_diff);
     MaybeCheckAndSynchronize();
@@ -309,22 +304,22 @@ template void CudaToGreyscale<InputFormat::BGRA8>(
     uint32_t height, CudaStream *stream);
 
 template void CudaToGreyscaleAndDecimateHalide<InputFormat::Mono8>(
-    const uint8_t *color_image, uint8_t *gray_image, uint8_t *decimated_image,
+    const GpuMemoryPitched<uint8_t> &color_image, GpuMemoryPitched<uint8_t> &decimated_image,
     uint8_t *unfiltered_minmax_image, uint8_t *minmax_image,
     uint8_t *thresholded_image, uint32_t width, uint32_t height,
     uint32_t min_white_black_diff, CudaStream *stream);
 template void CudaToGreyscaleAndDecimateHalide<InputFormat::YCbCr422>(
-    const uint8_t *color_image, uint8_t *gray_image, uint8_t *decimated_image,
+    const GpuMemoryPitched<uint8_t> &color_image, GpuMemoryPitched<uint8_t> &decimated_image,
     uint8_t *unfiltered_minmax_image, uint8_t *minmax_image,
     uint8_t *thresholded_image, uint32_t width, uint32_t height,
     uint32_t min_white_black_diff, CudaStream *stream);
 template void CudaToGreyscaleAndDecimateHalide<InputFormat::BGR8>(
-    const uint8_t *color_image, uint8_t *gray_image, uint8_t *decimated_image,
+    const GpuMemoryPitched<uint8_t> &color_image, GpuMemoryPitched<uint8_t> &decimated_image,
     uint8_t *unfiltered_minmax_image, uint8_t *minmax_image,
     uint8_t *thresholded_image, uint32_t width, uint32_t height,
     uint32_t min_white_black_diff, CudaStream *stream);
 template void CudaToGreyscaleAndDecimateHalide<InputFormat::BGRA8>(
-    const uint8_t *color_image, uint8_t *gray_image, uint8_t *decimated_image,
+    const GpuMemoryPitched<uint8_t> &color_image, GpuMemoryPitched<uint8_t> &decimated_image,
     uint8_t *unfiltered_minmax_image, uint8_t *minmax_image,
     uint8_t *thresholded_image, uint32_t width, uint32_t height,
     uint32_t min_white_black_diff, CudaStream *stream);

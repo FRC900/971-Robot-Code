@@ -92,10 +92,10 @@ template <typename T>
 class HostMemory {
  public:
   // Allocates a block of memory for holding up to size objects of type T.
-  HostMemory(size_t size) {
+  HostMemory(const size_t width, const size_t height) : width_(width), height_(height) {
     T *memory;
-    CHECK_CUDA(cudaMallocHost((void **)(&memory), size * sizeof(T)));
-    span_ = tcb::span<T>(memory, size);
+    CHECK_CUDA(cudaMallocHost((void **)(&memory), width_ * height_ * sizeof(T)));
+    span_ = tcb::span<T>(memory, width_ * height_);
   }
   HostMemory(const HostMemory &) = delete;
   HostMemory &operator=(const HostMemory &) = delete;
@@ -110,6 +110,10 @@ class HostMemory {
 
   // Returns the number of objects the memory can hold.
   size_t size() const { return span_.size(); }
+  size_t widthElements() const { return width_; }
+  size_t heightElements() const { return height_; }
+  size_t widthBytes() const { return width_ * sizeof(T); }
+  size_t heightBytes() const { return height_ * sizeof(T); }
 
   // Copies data from other (host memory) to this's memory.
   void MemcpyFrom(const T *other) {
@@ -126,6 +130,8 @@ class HostMemory {
 
  private:
   tcb::span<T> span_;
+  size_t width_;
+  size_t height_;
 };
 
 // Class to manage the lifetime of device memory.
@@ -134,40 +140,19 @@ class GpuMemory {
  public:
   // Allocates a block of memory for holding up to size objects of type T in
   // device memory.
-  GpuMemory(size_t size) : size_(size), owns_memory_(true) {
+  GpuMemory(const size_t size) : size_(size) {
     CHECK_CUDA(cudaMalloc((void **)(&memory_), size * sizeof(T)));
     // Since we could be allocating extra rows to pad to a given alignment,
     // make sure the padding is a known value.
     CHECK_CUDA(cudaMemset(memory_, 0, size * sizeof(T)));
   }
+
   GpuMemory(const GpuMemory &) = delete;
-
-  // Create an alias to an already allocated GPU memory block.
-  // This is useful for cases where operations on memory are a no-op
-  //   for certain input types - for example, for mono input imnages,
-  //   the GPU "color" image is the same as the one converted to grayscale.
-  GpuMemory &operator=(const GpuMemory &other) {
-    // If we currently own our memory, free it.
-    if (owns_memory_) {
-      CHECK_CUDA(cudaFree(memory_));
-    }
-
-    // Copy the memory pointer and size, making
-    // this an alias to the input GpuMemory object's data.
-    memory_ = other.memory_;
-    size_ = other.size_;
-    owns_memory_ = false;
-
-    return *this;
-  }
+  GpuMemory &operator=(const GpuMemory &other) = delete;
   GpuMemory(const GpuMemory &&) noexcept = delete;
   GpuMemory &operator=(const GpuMemory &&) noexcept = delete;
 
-  virtual ~GpuMemory() {
-    if (owns_memory_) {
-      CHECK_CUDA(cudaFree(memory_));
-    }
-  }
+  virtual ~GpuMemory() { CHECK_CUDA(cudaFree(memory_)); }
 
   // Returns the device pointer to the memory.
   T *get() { return memory_; }
@@ -197,7 +182,7 @@ class GpuMemory {
 
   // Copies data to host memory from this memory asynchronously on the provided
   // stream.
-  void MemcpyAsyncTo(T *host_memory, size_t size, CudaStream *stream) const {
+  void MemcpyAsyncTo(T *host_memory, const size_t size, CudaStream *stream) const {
     CHECK_CUDA(cudaMemcpyAsync(reinterpret_cast<void *>(host_memory),
                                reinterpret_cast<void *>(memory_),
                                sizeof(T) * size, cudaMemcpyDeviceToHost,
@@ -221,7 +206,7 @@ class GpuMemory {
   }
 
   // Copies data to host_memory from this memory.  Only copies size objects.
-  void MemcpyTo(T *host_memory, size_t size) const {
+  void MemcpyTo(T *host_memory, const size_t size) const {
     CHECK_CUDA(cudaMemcpy(reinterpret_cast<void *>(host_memory), memory_,
                           sizeof(T) * size, cudaMemcpyDeviceToHost));
   }
@@ -239,7 +224,7 @@ class GpuMemory {
 
   // Allocates a vector on the host, copies size objects into it, and returns
   // it.
-  std::vector<T> Copy(size_t s) const {
+  std::vector<T> Copy(const size_t s) const {
     CHECK_LE(s, size_);
     std::vector<T> result(s);
     MemcpyTo(result.data(), s);
@@ -253,7 +238,75 @@ class GpuMemory {
  private:
   T *memory_;
   size_t size_;
-  bool owns_memory_;
+};
+
+// Class to manage the lifetime of device memory storing 2D images
+// The width is padded to optimize device memory usage.
+template <typename T>
+class GpuMemoryPitched {
+ public:
+  // Allocates a block of memory for holding up to size objects of type T in
+  // device memory.
+  // Width and height are number of type-T elements (not bytes) in each dimension.
+  GpuMemoryPitched(const size_t width, const size_t height) : width_(width), height_(height) {
+    CHECK_CUDA(cudaMallocPitch((void **)(&memory_), &pitch_, width * sizeof(T), height_));
+    // Since we could be allocating extra rows to pad to a given alignment,
+    // make sure the padding is a known value.
+    CHECK_CUDA(cudaMemset(memory_, 0, pitch_ * height_ * sizeof(T)));
+  }
+  GpuMemoryPitched(const GpuMemoryPitched &) = delete;
+  GpuMemoryPitched &operator=(const GpuMemoryPitched &other) = delete;
+  GpuMemoryPitched(const GpuMemoryPitched &&) noexcept = delete;
+  GpuMemoryPitched &operator=(const GpuMemoryPitched &&) noexcept = delete;
+
+  virtual ~GpuMemoryPitched() { CHECK_CUDA(cudaFree(memory_)); }
+
+  // Copies data from host memory to this memory asynchronously on the provided
+  // stream. These assume host memory pitch and width are the same.
+  void MemcpyAsyncFrom(const T *host_memory, const size_t host_width, const size_t height, CudaStream *stream) {
+    // TODO - assert host_width * sizeof(T) == widthBytes() 
+    CHECK_CUDA(cudaMemcpy2DAsync(memory_, pitchBytes(),
+                                host_memory, host_width * sizeof(T),
+                                widthBytes(), height, cudaMemcpyHostToDevice,
+                                stream->get()));
+  }
+  void MemcpyAsyncFrom(const T *host_memory, const size_t host_width, CudaStream *stream) {
+    MemcpyAsyncFrom(host_memory, host_width, height_, stream);
+  }
+  // Copies data to host memory from this memory asynchronously on the provided
+  // stream. These assume host memory pitch and width are the same.
+  void MemcpyAsyncTo(T *host_memory, const size_t host_width, const size_t host_height, CudaStream *stream) const {
+    CHECK_CUDA(cudaMemcpy2DAync(reinterpret_cast<void *>(host_memory),
+                                host_width * sizeof(T),
+                                reinterpret_cast<void *>(memory_),
+                                pitchBytes(), host_width * sizeof(T), host_height,
+                                cudaMemcpyDeviceToHost,
+                                stream->get()));
+  }
+  // This assumes src and dest sizes and pitch are identical
+  void MemcpyAsyncTo(T *host_memory, CudaStream *stream) const {
+    MemcpyAsyncTo(host_memory, width_, height_, stream);
+  }
+  void MemcpyAsyncTo(HostMemory<T> *host_memory, CudaStream *stream) const {
+    MemcpyAsyncTo(host_memory->get(), stream);
+  }
+
+  T *get() { return memory_; }
+  const T *get() const { return memory_; }
+
+  // TODO - not sure which units make the most sense to expose to users
+  size_t pitchElements() const { return pitch_; }
+  size_t widthElements() const { return width_; }
+  size_t heightElements() const { return height_; }
+  size_t pitchBytes() const { return pitch_ * sizeof(T); }
+  size_t widthBytes() const { return width_ * sizeof(T); }
+  // size_t heightBytes() const { return height_ * sizeof(T); } // TODO - probably not needed
+  private:
+    T *memory_;
+    // Values below in elements, not bytes
+    size_t pitch_;
+    size_t width_;
+    size_t height_;
 };
 
 // Synchronizes and CHECKs for success the last CUDA operation.
