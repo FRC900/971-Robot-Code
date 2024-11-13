@@ -210,7 +210,10 @@ GpuDetector::GpuDetector(size_t width, size_t height,
       temp_storage_line_fit_scan_device_(
           DeviceScanInclusiveScanByKeyScratchSpace<uint32_t, LineFitPoint>(
               sorted_selected_blobs_device_.size())),
-      input_format_(input_format) {
+      input_format_(input_format),
+      aruco_marker_dict_(cv::aruco::PREDEFINED_DICTIONARY_NAME::DICT_APRILTAG_36h11),
+      s_tag_decoder_(aruco_marker_dict_, camera_matrix, distortion_coefficients, event_timings_) {
+  // color and gray images as a result.
   fit_quads_host_.reserve(kMaxBlobs);
   quad_corners_host_.reserve(kMaxBlobs);
 
@@ -252,6 +255,9 @@ GpuDetector::GpuDetector(size_t width, size_t height,
 
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
   zarray_ensure_capacity(detections_, kMaxBlobs);
+
+  s_tag_decoder_.initEngine("/home/ubuntu/900RobotCode/zebROS_ws/src/deeptag_ros/models", "apriltag_decoder_mono.onnx");
+
 }
 
 GpuDetector::~GpuDetector() {
@@ -834,6 +840,7 @@ void GpuDetector::Detect(const uint8_t *image) {
       // special case for Mono8 inputs - just assign pointers
       // rather than copying data
       gray_image_host_ptr_ = image;
+      gray_image_device_ = color_image_device_;
     } else {
       // Run this on a separate stream to overlap with later GPU compute
       // TODO - insert a false dependency to hold this from running until

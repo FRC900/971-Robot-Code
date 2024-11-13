@@ -8,12 +8,15 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "frc971/orin/apriltag_input_format.h"
+#include "frc971/orin/camera_matrix.h"
 #include "frc971/orin/cuda.h"
 #include "frc971/orin/cuda_event_timing.h"
 #include "frc971/orin/gpu_image.h"
 #include "frc971/orin/line_fit_filter.h"
 #include "frc971/orin/points.h"
 #include "frc971/orin/threshold.h"
+#include "frc971/orin/marker_dict.h"
+#include "frc971/orin/stag_decoder.h"
 
 namespace frc971::apriltag {
 
@@ -60,26 +63,6 @@ struct QuadCorners {
   float corners[4][2];
   bool reversed_border;
   uint32_t blob_index;
-};
-
-struct CameraMatrix {
-  double fx;
-  double cx;
-  double fy;
-  double cy;
-};
-
-struct DistCoeffs {
-  double k1;
-  double k2;
-  double p1;
-  double p2;
-  double k3;
-  double k4;
-  double k5;
-  double k6;
-  // Are we using 5 or 8 parameter model?
-  int num_params;
 };
 
 // GPU based april tag detector.
@@ -387,6 +370,9 @@ class GpuDetector {
   zarray_t *poly1_;
 
   zarray_t *detections_ = nullptr;
+
+  ArucoMarkerDict<6> aruco_marker_dict_;
+  ArucoSTagDecoder<6> s_tag_decoder_;
 };
 
 }  // namespace frc971::apriltag
