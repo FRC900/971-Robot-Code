@@ -1,3 +1,10 @@
+#ifndef __global__
+#define __global__
+#endif
+#ifndef __host__
+#define __host__
+#endif
+
 #include <cmath>
 #include <vector>
 
@@ -24,6 +31,9 @@
 #include "frc971/orin/apriltag_input_format.h"
 #include "frc971/orin/labeling_allegretti_2019_BKE.h"
 #include "frc971/orin/threshold.h"
+
+#include "opencv2/opencv.hpp"
+#include "frc971/orin/warp_perspective_points.h"
 
 ABSL_FLAG(int32_t, debug_blob_index, 4096, "Blob to print out for");
 
@@ -621,7 +631,176 @@ void GpuDetector::QuadDecodeTask(void *_u) {
   }
 }
 
+cv::Point2d centroid(const std::array<cv::Point2d, 4> &points)
+{
+  cv::Point2d sum(0,0);
+  for (const auto &p: points)
+  {
+    sum += p;
+  }
+  sum.x /= points.size();
+  sum.y /= points.size();
+  return sum;
+}
+
+void merge_rois(std::array<cv::Point2d, 4> &merged, const std::array<cv::Point2d, 4> &roi)
+{
+  merged[0].x = std::min(merged[0].x, roi[0].x);
+  merged[0].y = std::min(merged[0].y, roi[0].y);
+
+  merged[1].x = std::max(merged[1].x, roi[1].x);
+  merged[1].y = std::min(merged[1].y, roi[1].y);
+
+  merged[2].x = std::max(merged[2].x, roi[2].x);
+  merged[2].y = std::max(merged[2].y, roi[2].y);
+
+  merged[3].x = std::min(merged[3].x, roi[3].x);
+  merged[3].y = std::max(merged[3].y, roi[3].y);
+}
+
+void display_rois(cv::Mat &image, const std::vector<std::array<cv::Point2d, 4>> &rois, cv::Scalar color)
+{
+  for (size_t ii = 0; ii < rois.size(); ii++)
+  {
+    for (size_t r = 0; r < rois[ii].size(); r++)
+    {
+      cv::line( image, rois[ii][r], rois[ii][(r + 1) % rois[ii].size()], color, 2);
+    }
+    cv::putText(image, std::to_string(ii), cv::Point2d(rois[ii][0].x, rois[ii][0].y - 5), 0, 0.75, cv::Scalar(0, 128, 0), 2);
+  }
+}
+
+// Some of the ROI's end up looking like triangles rather
+// than rectangles. Use this function to filter out those
+// that have coordinates nearly on top of each other.
+bool roi_points_too_close(const std::array<cv::Point2d, 4> &roi)
+{
+  for (size_t ii = 0; ii < 4; ii++)
+  {
+    if (cv::norm(roi[ii] - roi[(ii + 1) % 4]) < 10)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+static cv::Mat getTag(const cv::Mat &image, const size_t outputHW,
+                      const cv::Mat H) {
+  cv::Mat tag;
+  warpPerspective(image, tag, H, cv::Size(outputHW, outputHW));
+  return tag;
+}
+
+template <size_t GRID_SIZE>
+static void writeStage2Debug(cv::Mat &image,
+                             PointsAndIDs<GRID_SIZE + 2> keypointsAndIds,
+                             std::array<cv::Point2d, 4> corners,
+                             const cv::Mat H,
+                             const uint16_t tagId) {
+  warpPerspectivePts(H, keypointsAndIds.m_point);
+  for (size_t kp = 0; kp < keypointsAndIds.m_point.size(); kp++) {
+    const auto id = keypointsAndIds.m_id[kp];
+    cv::circle(image,
+               cv::Point2d(keypointsAndIds.m_point[kp].x,
+                           keypointsAndIds.m_point[kp].y),
+               3,
+               (id < 0)    ? cv::Scalar(255, 0, 0)
+               : (id == 0) ? cv::Scalar(0, 0, 255)
+                           : cv::Scalar(0, 255, 0));
+  }
+  warpPerspectivePts(H, corners);
+  for (size_t kp = 0; kp < corners.size(); kp++) {
+    cv::line(image, corners[kp], corners[(kp + 1) % corners.size()],
+             cv::Scalar(0, 255, 255), 2);
+  }
+  std::stringstream s;
+  s << tagId;
+  cv::putText(image, s.str(), cv::Point(5, 35), 0, 1.5, cv::Scalar(0, 255, 255),
+              2);
+}
+
+template <size_t GRID_SIZE>
+void visualizeStage2(cv::Mat &image, const size_t outputHW,
+                     const std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> &result) {
+  cv::Mat output(
+      outputHW * 2,                                                // rows
+      outputHW * std::max(result.size(), static_cast<size_t>(1)),  // cols
+      CV_8UC3, cv::Scalar(255, 255, 255));
+  if (result.empty()) {
+    image = output;
+    return;
+  }
+  cv::Mat tag;
+  // Arrange tags horizontally, with the first pass of the tag decode on top and
+  // second on the bottom
+  for (size_t i = 0; i < result.size(); i++) {
+    tag = getTag(image, outputHW, result[i][0].m_HCrop);
+    writeStage2Debug<GRID_SIZE>(tag, result[i][0].m_keypointsWithIds, result[i][0].m_roi, result[i][0].m_HCrop, result[i][0].m_tagId);
+    tag.copyTo(output(cv::Rect(i * outputHW, 0, outputHW, outputHW)));
+
+    tag = getTag(image, outputHW, result[i][1].m_HCrop);
+    writeStage2Debug<GRID_SIZE>(tag, result[i][1].m_keypointsWithIds, result[i][1].m_roi, result[i][1].m_HCrop, result[i][1].m_tagId);
+    tag.copyTo(output(cv::Rect(i * outputHW, outputHW, outputHW, outputHW)));
+  }
+  image = output;
+}
+
 void GpuDetector::DecodeTags() {
+
+  std::vector<std::array<cv::Point2d, 4>> rois;
+  for (const auto &quad : quad_corners_host_) {
+    rois.emplace_back();
+    for (size_t ii = 0; ii < 4; ii++) {
+      rois.back()[ii] = cv::Point2d(quad.corners[ii][0], quad.corners[ii][1]);
+    }
+  }
+  // Sort corners in clockwise order
+  std::vector<cv::Point2d> centroids;
+  for (auto roi : rois) {
+    const auto c = centroid(roi);
+    centroids.push_back(c);
+    std::sort(roi.begin(), roi.end(), [&c](const cv::Point2d &a, const cv::Point2d &b) 
+    {
+      return atan2(a.y - c.y, a.x - c.x) < atan2(b.y - c.y, b.x - c.x);
+    }
+    );
+  }
+  cv::Mat image(original_height_, width_, CV_8UC1, const_cast<uint8_t *>(gray_image_host_ptr_));
+  cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);
+  // display_rois(image, rois, cv::Scalar(0, 128, 128));
+
+  // Filter out triangle-like rois
+  std::vector<std::array<cv::Point2d, 4>> filtered_rois;
+  for (const auto &roi : rois) {
+    if (!roi_points_too_close(roi)) {
+      filtered_rois.push_back(roi);
+    }
+  }
+  // display_rois(image, filtered_rois, cv::Scalar(0, 255, 0));
+  // cv::imshow("rois", image);
+
+  auto cross = [](const cv::Point2d &a, const cv::Point2d &b) {
+    return a.x * b.y - a.y * b.x;
+  };
+  std::vector<std::array<cv::Point2d, 4>> filtered_rois2;
+  for (const auto &roi: filtered_rois) {
+    auto area = 0.5 * fabs(cross(roi[0], roi[1]) + cross(roi[1], roi[2]) + cross(roi[2], roi[3]) + cross(roi[3], roi[0]));
+    std::cout << "Area: " << area << std::endl;
+    if (area > 500) {
+      filtered_rois2.push_back(roi);
+    }
+  }
+
+  const auto tag_output = s_tag_decoder_.detectTags(ToGpuImage(gray_image_device_), filtered_rois);
+
+  cv::Mat stage2_debug_image = image.clone();
+  visualizeStage2<6>(stage2_debug_image, 256, tag_output);
+  cv::imshow("Stage2 Debug", stage2_debug_image);
+
+  display_rois(image, filtered_rois2, cv::Scalar(0, 255, 0));
+  cv::imshow("rois", image);
+  cv::waitKey(0);
   size_t chunksize =
       1 + quad_corners_host_.size() /
               (APRILTAG_TASKS_PER_THREAD_TARGET * tag_detector_->nthreads);
