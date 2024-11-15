@@ -24,15 +24,17 @@ template <class OUTPUT, class GRID_DIM, class PREDICATE>
 class ConfidenceFilter
 {
 public:
-    explicit ConfidenceFilter(const size_t blockSize);
+    explicit ConfidenceFilter();
 
     ConfidenceFilter(const ConfidenceFilter &other) = delete;
-    ConfidenceFilter(ConfidenceFilter &&other) noexcept = delete;
+    ConfidenceFilter(ConfidenceFilter &&other) noexcept = default;
 
     ConfidenceFilter &operator=(const ConfidenceFilter &other) = delete;
     ConfidenceFilter &operator=(ConfidenceFilter &&other) noexcept = delete;
 
     virtual ~ConfidenceFilter();
+
+    ConfidenceFilter *withConfidence(const float confidence);
 
     // Takes array of input T's, where T has a .confidence field.
     // Returns a compacted array of Ts with the T's with confidence 
@@ -41,7 +43,6 @@ public:
                 GRID_DIM gridDims,
                 const float centerVariance,
                 const float scaleVariance,
-                const float confidence,
                 cudaStream_t cudaStream, 
                 const bool forceCudaGraphRegen);
 
@@ -55,7 +56,7 @@ private:
     cudaGraphExec_t m_cudaGraphInstance;
     uint32_t *m_hOutputCountPtr{nullptr};
     size_t m_count{0};
-    size_t m_blockSize{0};
+    size_t m_blockSize{1024};
 
     // Scratch space needed for cuCompactor. Reallocated only when needed because
     // of changes in image size (i.e. hopefully never for an input video stream)
@@ -64,30 +65,21 @@ private:
 
     // functor used to test confidence of predictions
     PREDICATE m_predicate{0};
-};
 
-// Predicate to filter on a single float confidence value
-class Stage1Predicate
-{
-public:
-    explicit Stage1Predicate(const float confidence)
-        : m_confidence{confidence}
-    {}
-    __device__ bool operator()(const float *f, const int index, const int length) const;
-    __device__ const char *getName() const { return "Stage1"; }
-    float m_confidence;
+    bool m_needNewCudaGraph{true};
 };
 
 // Predicate to filter on the best of 2 non-background scores
-class Stage2Predicate
+// TODO : does this need to have m_confidence copied from host to device when changed?
+class DecoderPredicate
 {
 public:
-    explicit Stage2Predicate(const float confidence)
+    explicit DecoderPredicate(const float confidence)
         : m_confidence{confidence}
     {}
     __device__ bool operator()(const float *f, const int index, const int length) const;
     __device__ const char *getName() const { return "Stage2"; }
-    float m_confidence;
+    float m_confidence{0.6f};
 };
 
 #endif

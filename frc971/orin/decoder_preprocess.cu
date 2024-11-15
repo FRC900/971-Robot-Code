@@ -1,6 +1,10 @@
+#ifndef __global__
+#define __global__
+#endif
+
 #include "frc971/orin/decoder_preprocess.h"
 #include "frc971/orin/cuda_utils.h"
-#include <iostream>
+#include "cuda_runtime.h"
 
 // Kernel to extract stage 2 tag images from full camera image into CH,256,256 tensors
 

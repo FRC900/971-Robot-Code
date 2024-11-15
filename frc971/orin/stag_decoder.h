@@ -63,6 +63,9 @@ public:
  cudaStream_t getCudaStream(void);
 
 private:
+    // TODO - not sure how configurable this needs to be
+    static constexpr size_t m_maxBatchSize = 4;
+
     void runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroupss,
                       std::vector<std::array<float2, 4>> &stage2Corners,
                       const GpuImage<uint8_t> &detectInputs,
@@ -84,15 +87,15 @@ private:
     // call, and the code takes care of extracting potentially multiple tag 
     // detection regions from this image and stuffs them into the model input.
     std::vector<std::vector<GpuImage<uint8_t>>> m_engineInputs;
-
-    ConfidenceFilter<Stage2Keypoint, const tcb::span<const GridPriorValue> &, Stage2Predicate> m_confidenceFilter{1024};
+    
+    // Use a different confidence filter per batch to allow us to use
+    // cudaGraphs for each batch's confidence calcs.
+    std::array<ConfidenceFilter<Stage2Keypoint, const tcb::span<const GridPriorValue> &, DecoderPredicate>, m_maxBatchSize> m_confidenceFilters;
     Stage2KeypointTrust m_keypointTrust;
     SuppressAndAverageKeypoints<Stage2Keypoint, Stage2KeypointGroup> m_keypointGrouper;
 
     Stage2Corners m_corners;
 
-    // TODO - not sure how configurable this needs to be
-    static constexpr size_t m_maxBatchSize = 4;
     double m_minGridMatchRatio = 0.4;
 };
 

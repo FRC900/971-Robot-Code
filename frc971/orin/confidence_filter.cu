@@ -4,8 +4,7 @@
 #include "frc971/orin/cuda_utils.h"
 
 template <class OUTPUT, class GRID_DIM, class PREDICATE>
-ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::ConfidenceFilter(const size_t blockSize)
-    : m_blockSize(blockSize)
+ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::ConfidenceFilter(void)
 {
     // Output size is calculated as cumulative size up to the last block plus the
     // number of outputs from the final block.
@@ -16,14 +15,25 @@ ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::ConfidenceFilter(const size_t blo
 template <class OUTPUT, class GRID_DIM, class PREDICATE>
 ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::~ConfidenceFilter(void)
 {
+    std::cout << "ConfidenceFilter::~ConfidenceFilter" << std::endl;
     cudaSafeCall(cudaFree(m_dOutput));
     cudaSafeCall(cudaFreeHost(m_hOutputCountPtr));
     cudaSafeCall(cudaFree(m_dBlocksCount));
     cudaSafeCall(cudaFree(m_dBlocksOffset));
 
-    cudaSurfaceFormatMode(cudaEventDestroy(m_outputReadyEvent));
+    cudaSafeCall(cudaEventDestroy(m_outputReadyEvent));
 }
 
+// Set min confidence for a valid element
+template <class OUTPUT, class GRID_DIM, class PREDICATE>
+ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE> *ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::withConfidence(const float confidence)
+{
+
+    m_predicate.m_confidence = confidence;
+    m_needNewCudaGraph = true;
+
+    return this;
+}
 template <class OUTPUT, class GRID_DIM, class PREDICATE>
 bool ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::reallocBuffers(const size_t count, cudaStream_t cudaStream)
 {
@@ -50,13 +60,11 @@ void ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::detect(const std::array<cons
                                                            const GRID_DIM gridDims,
                                                            const float centerVariance,
                                                            const float sizeVariance,
-                                                           const float confidence,
                                                            cudaStream_t cudaStream,
                                                            const bool forceCudaGraphRegen)
 {
-    m_predicate.m_confidence = confidence;
     const bool buffersResized = reallocBuffers(gridDims.size(), cudaStream);
-    if (buffersResized || forceCudaGraphRegen)
+    if (buffersResized || forceCudaGraphRegen || m_needNewCudaGraph)
     {
         std::cout << "Keypoint detector : generating CUDA graph buffersResize = " <<  buffersResized << " forceCudaGraphRegen = " << forceCudaGraphRegen << std::endl;
         cudaSafeCall(cudaStreamSynchronize(cudaStream));
@@ -77,6 +85,7 @@ void ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::detect(const std::array<cons
 
         cudaSafeCall(cudaGraphInstantiate(&m_cudaGraphInstance, m_cudaGraph, NULL, NULL, 0));
         cudaSafeCall(cudaStreamSynchronize(cudaStream));
+        m_needNewCudaGraph = false;
     }
     cudaSafeCall(cudaGraphLaunch(m_cudaGraphInstance, cudaStream));
     cudaSafeCall(cudaEventRecord(m_outputReadyEvent, cudaStream));
@@ -91,19 +100,13 @@ tcb::span<const OUTPUT> ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::getOutput
     return tcb::span<const OUTPUT>(m_dOutput, m_hOutputCountPtr[0]);
 }
 
-// Predicate to filter on a single float confidence value
-__device__ bool Stage1Predicate::operator()(const float *f, const int index, const int length) const
-{
-    //printf("f[%u] = %f, m_confidence = %f\n", index, f[index], m_confidence);
-    return f[index] > m_confidence;
-}
 
 // Predicate to filter on the max of two confidences
-__device__ bool Stage2Predicate::operator()(const float *f, const int index, const int length) const
+__device__ bool DecoderPredicate::operator()(const float *f, const int index, const int length) const
 {
     return max(f[index], f[index + length]) > m_confidence;
 }
 
 #include "frc971/orin/grid_prior_value.h"
 #include "frc971/orin/stage2_keypoint.h"
-template class ConfidenceFilter<Stage2Keypoint, const tcb::span<const GridPriorValue> &, Stage2Predicate>;
+template class ConfidenceFilter<Stage2Keypoint, const tcb::span<const GridPriorValue> &, DecoderPredicate>;

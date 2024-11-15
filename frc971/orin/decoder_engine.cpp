@@ -100,7 +100,7 @@ cv::Mat DecoderEngine::getH(const size_t idx) const
 }
 
 // Input image is stage 1 GPU input image, before being preprocessed, resized, whatever
-// Output blobs are crops from those images, mapping from RoI in the input image to a 3,256,256 crop
+// Output blobs are crops from those images, mapping from RoI in the input image to a 1,256,256 crop
 // hopefully holding a valid tag
 // Note, this can potentially be broken up into multiple batches (if there are more RoIs than
 // max batch size) so we'll need state to start from the correct RoI index
@@ -174,18 +174,28 @@ void DecoderEngine::blobFromGpuImageWrappers(const std::vector<GpuImage<uint8_t>
                                                                          float2{0., 1.},
                                                                          m_preprocCudaStreams[batchIdx]));
         cudaSafeCall(cudaEventRecord(m_preprocCudaEvents[batchIdx], m_preprocCudaStreams[batchIdx]));
+    }
+    // Each preproc kernel runs on a separate stream in to potentially
+    // extract multiple RoIs in parallel.  Wait for all of them to finish
+    // before running the inference kernel on the main stream.
+    for (size_t batchIdx = 0; batchIdx < thisBatchSize; batchIdx++)
+    {
+        cudaSafeCall(cudaStreamWaitEvent(getCudaStream(), m_preprocCudaEvents[batchIdx]));
+    }
+
 #ifdef DEBUG
+    // Run these after waiting on the main stream so that the preproc kernel
+    // is finished before we try to copy the data back
+    for (size_t batchIdx = 0; batchIdx < thisBatchSize; batchIdx++)
+    {
         cv::Mat m = getDebugImage(batchIdx);
         std::stringstream s;
         s << "C" << callNum << "B" << batchIdx;
         cv::imshow(s.str().c_str(), m);
         // cv::imwrite(s.str() + ".png", m);
+    }
 #endif
-    }
-    for (size_t batchIdx = 0; batchIdx < thisBatchSize; batchIdx++)
-    {
-        cudaSafeCall(cudaStreamWaitEvent(getCudaStream(), m_preprocCudaEvents[batchIdx]));
-    }
+
 #ifdef DEBUG
 callNum++;
 #endif

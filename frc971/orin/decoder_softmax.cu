@@ -1,3 +1,7 @@
+#ifndef __global__
+#define __global__
+#endif
+
 #include "frc971/orin/cuda_utils.h"
 #include "frc971/orin/decoder_softmax.h"
 #include <iostream>
@@ -72,7 +76,7 @@ void DecoderSoftmax::compute(const float *input, const uint32_t count, cudaStrea
     cudaSafeCall(cudaGetLastError());
 }
 
-const tcb::span<const float> DecoderSoftmax::getOutput(void) const
+tcb::span<const float> DecoderSoftmax::getOutput(void) const
 {
-    return tcb::span<const float>(m_dResults, m_resultLength);
+    return tcb::span<const float>(m_dResults, m_resultLength * 2);
 }
