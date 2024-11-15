@@ -1,9 +1,9 @@
 #ifndef DECODER_SOFTMAX_
 #define DECODER_SOFTMAX_
 
-#include <cuda_runtime.h>
 #include "frc971/orin/decoder_softmax_results.h"
 #include "gpu_apriltag/span.hpp"
+#include <cuda_runtime.h>
 
 // Class to handle DecoderSoftmax ops.
 // Input is result from model, all bg scores (h x w) followed by all fg scores
@@ -21,7 +21,7 @@ public:
 
     virtual ~DecoderSoftmax();
     void compute(const float *input, const uint32_t count, cudaStream_t cudaStream);
-    const tcb::span<const float> getOutput(void) const;
+    tcb::span<const float> getOutput(void) const;
 
 private:
     void allocateResults(const uint32_t count);

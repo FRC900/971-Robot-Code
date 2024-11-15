@@ -29,6 +29,10 @@ STagDecoder<MARKER_DICT, GRID_SIZE>::STagDecoder(const MARKER_DICT &markerDict,
     m_distCoeffs = (cv::Mat_<double>(1, 8) << distCoeffs.k1, distCoeffs.k2, distCoeffs.p1, distCoeffs.p2, distCoeffs.k3, 0, 0, 0);
     m_engineInputs.emplace_back();
     m_engineInputs[0].emplace_back();
+    for (auto &cf : m_confidenceFilters)
+    {
+        cf.withConfidence(0.6f); // default min confidence for keypoints
+    }
 }
 
 template <class MARKER_DICT, size_t GRID_SIZE>
@@ -48,7 +52,7 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::initEngine(const std::string &modelPat
     decodeOptions.calibrationDataDirectoryPath = "/home/ubuntu";
     // If the model does not support dynamic batch size, then the below two parameters must be set to 1.
     // Specify the batch size to optimize for.
-    decodeOptions.optBatchSize = 4;
+    decodeOptions.optBatchSize = m_maxBatchSize;
     // Specify the maximum batch size we plan on running.
     decodeOptions.maxBatchSize = m_maxBatchSize;
     m_decodeEngine = std::make_unique<DecoderEngine>(decodeOptions);
@@ -64,6 +68,20 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::initEngine(const std::string &modelPat
     }
 }
 
+#ifdef DEBUG
+#include <frc971/orin/cuda_utils.h>
+static void dump_output(const std::string &filename, const float *dData, size_t size, cudaStream_t stream)
+{
+    cudaSafeCall(cudaStreamSynchronize(stream));
+    auto hData = std::make_unique<float[]>(size);
+    cudaSafeCall(cudaMemcpy(hData.get(), dData, size * sizeof(float), cudaMemcpyDeviceToHost));
+    std::ofstream os(filename);
+    for (size_t i = 0; i < size; i++)
+    {
+        os << i << ", " << hData[i] << std::endl;
+    }
+}
+#endif
 // Run 1 batch of inference.
 // Batch size is inferred from rois.size()
 // append results to vector of Stage2Keypoint vectors, 1 per input RoI
@@ -78,6 +96,7 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
                                                        const tcb::span<const std::array<cv::Point2d, 4>> &rois)
 {
     // Run a batch of results in one inference pass
+    ScopedEventTiming t(m_timing, "sTagDecoder_runInference", m_decodeEngine->getCudaStream());
     m_timing.start("setROIs", m_decodeEngine->getCudaStream());
 #ifdef DEBUG
     printPoints("rois[0]", rois[0]);
@@ -95,87 +114,107 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
     }
     m_timing.end("decode_runInference");
 
+#ifdef DEBUG
+    // Debug raw model output
+    for (size_t roiNum = 0; roiNum < rois.size(); roiNum++)
+    {
+        std::string fname = "stage2_softmax_" + std::to_string(roiNum) + ".csv";
+        dump_output(fname, m_decodeEngine->getBufferByName("confidences_pred", roiNum), 32 * 32 * 3, m_decodeEngine->getCudaStream());
+        fname = "locations_pred_" + std::to_string(roiNum) + ".csv";
+        dump_output(fname, m_decodeEngine->getBufferByName("locations_pred", roiNum), 32 * 32 * 2, m_decodeEngine->getCudaStream());
+        fname = "corners_locations_pred_" + std::to_string(roiNum) + ".csv";
+        dump_output(fname, m_decodeEngine->getBufferByName("corner_locations_pred", roiNum), 2 * 2 * 2, m_decodeEngine->getCudaStream());
+    }
+#endif
+
     // Priors are the same for each batch # in the output, generate
     // them just once here
-    m_timing.start("stage2_corner_priors", m_decodeEngine->getCudaStream());
+    m_timing.start("decode_corner_priors", m_decodeEngine->getCudaStream());
     // model input size and image size are the same
     // Divide x&y by 128 to get a 2x2 grid giving four corner points
     // of the outer black border of the tag
     m_stage2CornerPrior.generate(getModelSize(), 128, getModelSize(), {}, m_decodeEngine->getCudaStream());
-    m_timing.end("stage2_corner_priors");
+    m_timing.end("decode_corner_priors");
 
     // Grid priors create a 32x32 grid of anchor points for keypoint detection
     // Each has an associated offset from the anchor point along with a class confidence
     // (background or foreground black or white)
-    m_timing.start("stage2_grid_priors", m_decodeEngine->getCudaStream());
+    m_timing.start("decode_grid_priors", m_decodeEngine->getCudaStream());
     m_stage2GridPrior.generate(getModelSize(), 8, getModelSize(), {}, m_decodeEngine->getCudaStream());
-    m_timing.end("stage2_grid_priors");
+    m_timing.end("decode_grid_priors");
 
-    for (size_t roiNum = 0; roiNum < rois.size(); roiNum++)
+    for (size_t batchIdx = 0; batchIdx < rois.size(); batchIdx++)
     {
+        // TODO - consider a cudagraph capturing the softmax - > keypoint detect -> trust 
+        // graph. Would require a separate softmax and trust for each batch output since the buffers
+        // are different for each.
+
         // Run softmax on the keypoint grid output, giving a confidence for
         // each keypoint being a black or white corner. We drop any keypoints
         // which are part of the background class.
-        m_timing.start("stage2_softmax", m_decodeEngine->getCudaStream());
-        m_stage2DecoderSoftmax.compute(m_decodeEngine->getBufferByName("confidences_pred", roiNum),
+        m_timing.start("decode_softmax", m_decodeEngine->getCudaStream());
+        m_stage2DecoderSoftmax.compute(m_decodeEngine->getBufferByName("confidences_pred", batchIdx),
                                        32 * 32,
                                        m_decodeEngine->getCudaStream());
-        m_timing.end("stage2_softmax");
+        m_timing.end("decode_softmax");
+#ifdef DEBUG
+        std::string fname = "stage2_softmax_computed_" + std::to_string(batchIdx) + ".csv";
+        const auto softmaxOutput = m_stage2DecoderSoftmax.getOutput();
+        dump_output(fname, softmaxOutput.data(), softmaxOutput.size(), m_decodeEngine->getCudaStream());
+#endif
         
         // Grab keypoint coordinates by applying offsets to the grid anchor points
         // Filter out keypoints with low confidence
-        m_timing.start("stage2_keypoint_detect", m_decodeEngine->getCudaStream());
-        m_confidenceFilter.detect({m_stage2DecoderSoftmax.getOutput().data(),
-                                   m_decodeEngine->getBufferByName("locations_pred", roiNum),
-                                   nullptr /* not used */},
-                                  m_stage2GridPrior.getOutput(),
-                                  0.05f,             // centerVariance
-                                  0.0f,              // sizeVariance - not used for keypoints
-                                  0.6f,              // min confidence // TODO : configurable
-                                  m_decodeEngine->getCudaStream(),
-                                  buffersResized);
-        buffersResized = false; // only need to re-do cuda graphs once per iteration, they're the same until the next infer call at least
-        m_timing.end("stage2_keypoint_detect");
+        m_timing.start("decode_keypoint_detect", m_decodeEngine->getCudaStream());
+        m_confidenceFilters[batchIdx].detect({m_stage2DecoderSoftmax.getOutput().data(),
+                                            m_decodeEngine->getBufferByName("locations_pred", batchIdx),
+                                            nullptr /* not used */},
+                                           m_stage2GridPrior.getOutput(),
+                                           0.05f,             // centerVariance - defined when training model so not configurable
+                                           0.0f,              // sizeVariance - not used for keypoints
+                                           m_decodeEngine->getCudaStream(),
+                                           buffersResized);
+        m_timing.end("decode_keypoint_detect");
 
-        m_timing.start("stage2_trust", m_decodeEngine->getCudaStream());
-        const bool trustFlag = m_keypointTrust.check(m_confidenceFilter.getOutput(), m_decodeEngine->getCudaStream());
-        m_timing.end("stage2_trust");
+        m_timing.start("decode_trust", m_decodeEngine->getCudaStream());
+        const bool trustFlag = m_keypointTrust.check(m_confidenceFilters[batchIdx].getOutput(), m_decodeEngine->getCudaStream());
+        m_timing.end("decode_trust");
 
 #ifdef DEBUG
-        std::cout << " roiNum = " << roiNum << " trustFlag = " << (int)trustFlag << std::endl;
+        std::cout << " batchIdx = " << batchIdx << " trustFlag = " << (int)trustFlag << std::endl;
 #endif
         stage2KeypointGroups.emplace_back();
         stage2Corners.emplace_back();
         if (trustFlag)
         {
             // Group nearby keypoints by taking the average of their locations weighted by confidence
-            m_timing.start("stage2_keypoint_group", m_decodeEngine->getCudaStream());
-            m_keypointGrouper.compute(m_confidenceFilter.getOutput(), 12, 0.0, m_decodeEngine->getCudaStream());
-            m_timing.end("stage2_keypoint_group");
+            m_timing.start("decode_keypoint_group", m_decodeEngine->getCudaStream());
+            m_keypointGrouper.compute(m_confidenceFilters[batchIdx].getOutput(), 12, 0.0, m_decodeEngine->getCudaStream());
+            m_timing.end("decode_keypoint_group");
 
             // Compute corner locations as offsets from the corner prior anchor points
             // Do this here so the memcpy from the keypoint grouper above has time
             // to possibly finish
-            m_timing.start("stage2_corner_locations", m_decodeEngine->getCudaStream());
-            m_corners.compute(m_decodeEngine->getBufferByName("corner_locations_pred", roiNum),
+            m_timing.start("decode_corner_locations", m_decodeEngine->getCudaStream());
+            m_corners.compute(m_decodeEngine->getBufferByName("corner_locations_pred", batchIdx),
                               m_stage2CornerPrior.getOutput(),
                               0.05f,
                               m_decodeEngine->getCudaStream());
-            m_timing.end("stage2_corner_locations");
+            m_timing.end("decode_corner_locations");
 
             // Grab the host outputs of each of the above operations
-            m_timing.start("stage2_keypoint_group_out", m_decodeEngine->getCudaStream());
+            m_timing.start("decode_keypoint_group_out", m_decodeEngine->getCudaStream());
             const tcb::span<const Stage2KeypointGroup> hStage2KeypointGroup = m_keypointGrouper.getOutput();
             for (const auto &k : hStage2KeypointGroup)
             {
-                stage2KeypointGroups.back().push_back(k);
+                stage2KeypointGroups.back().emplace_back(k);
             }
-            m_timing.end("stage2_keypoint_group_out");
+            m_timing.end("decode_keypoint_group_out");
 
-            m_timing.start("stage2_corners_out", m_decodeEngine->getCudaStream());
+            m_timing.start("decode_corners_out", m_decodeEngine->getCudaStream());
             const tcb::span<const float2> hStage2Corners = m_corners.getHostOutput();
             std::copy(hStage2Corners.begin(), hStage2Corners.end(), stage2Corners.back().begin());
-            m_timing.end("stage2_corners_out");
+            m_timing.end("decode_corners_out");
         }
     }
 }
@@ -230,14 +269,14 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                 ret[retIdx][iter].m_HCrop = m_decodeEngine->getH(ii);
                 ret[retIdx][iter].m_isValid = stage2KeypointGroups[retIdx].size() > 0;
 #ifdef DEBUG
-                std::cout << "iter = " << iter << " ret[" << retIdx << "].m_isValid = " << ret[retIdx].m_isValid << std::endl;
+                std::cout << "iter = " << iter << " ret[" << retIdx << "][" << iter << "].m_isValid = " << ret[retIdx][iter].m_isValid << std::endl;
 #endif
                 if (ret[retIdx][iter].m_isValid)
                 {
 #ifdef DEBUG
                     std::cout << "MatchFineGrid : ii = " << ii << " retIdx = " << retIdx << std::endl;
 #endif
-                    m_timing.start("stage2_matchfinegrid", m_decodeEngine->getCudaStream());
+                    m_timing.start("decode_matchfinegrid", m_decodeEngine->getCudaStream());
                     double matchRatio;
                     constexpr auto FINE_GRID_SIZE = MARKER_DICT::getGridSize() + 2;
                     PointsAndIDs <FINE_GRID_SIZE> orderedFineGridPointsIds;
@@ -251,25 +290,25 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                                                                     stage2Corners[retIdx],
                                                                     m_cameraMatrix, // cameraMatrix
                                                                     m_distCoeffs);  // distCoeffs
-                    m_timing.end("stage2_matchfinegrid");
+                    m_timing.end("decode_matchfinegrid");
 
 #ifdef DEBUG
                     std::cout << "matchRatio = " << matchRatio << " m_minGridMatchRatio " << m_minGridMatchRatio << std::endl;
 #endif
                     if (matchRatio > m_minGridMatchRatio)
                     {
-                        // m_timing.start("stage2_fillemptyids", m_decodeEngine->getCudaStream());
+                        // m_timing.start("decode_fillemptyids", m_decodeEngine->getCudaStream());
                         //fillEmptyIds(orderedFineGridPointsIds, stage2KeypointGroups[retIdx]);
-                        // m_timing.end("stage2_fillemptyids");
+                        // m_timing.end("decode_fillemptyids");
 
-                        m_timing.start("stage2_updatecornersinimage", m_decodeEngine->getCudaStream());
+                        m_timing.start("decode_updatecornersinimage", m_decodeEngine->getCudaStream());
                         const auto roiUpdated = m_markerDict.getUnitTagTemplate().updateCornersInImage(orderedFineGridPointsIds,
                                                                                                        m_decodeEngine->getH(ii),
                                                                                                        m_cameraMatrix,
                                                                                                        m_distCoeffs);
-                        m_timing.end("stage2_updatecornersinimage");
+                        m_timing.end("decode_updatecornersinimage");
 
-                        m_timing.start("stage2_getmainindex", m_decodeEngine->getCudaStream());
+                        m_timing.start("decode_getmainindex", m_decodeEngine->getCudaStream());
                         thisRois[retIdx] = roiUpdated;
                         ret[retIdx][iter].m_roi = roiUpdated;
 
@@ -283,16 +322,16 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                                                 orderedFineGridPointsIds.m_id,
                                                 hammingDist);
 #ifdef DEBUG
-                        std::cout << "mainIdx = " << ret[retIdx].m_mainIdx << " tagId = " << ret[retIdx].m_tagId << std::endl;
+                        std::cout << "mainIdx = " << ret[retIdx][iter].m_mainIdx << " tagId = " << ret[retIdx][iter].m_tagId << std::endl;
 #endif
-                        m_timing.end("stage2_getmainindex");
+                        m_timing.end("decode_getmainindex");
 
-                        m_timing.start("stage2_reorderpointswithmainidx", m_decodeEngine->getCudaStream());
+                        m_timing.start("decode_reorderpointswithmainidx", m_decodeEngine->getCudaStream());
                         m_markerDict.getUnitTagTemplate().reorderPointsWithMainIdx(ret[retIdx][iter].m_keypointsWithIds, // [re] orderedFineGridPointsIds
                                                                                    ret[retIdx][iter].m_mainIdx,
                                                                                    orderedFineGridPointsIds);
                         warpPerspectivePts(ret[retIdx][iter].m_HCrop.inv(), ret[retIdx][iter].m_keypointsWithIds.m_point);
-                        m_timing.end("stage2_reorderpointswithmainidx");
+                        m_timing.end("decode_reorderpointswithmainidx");
 #ifdef DEBUG
                         std::cout << "orderedFineGripPointsIds" << std::endl
                                   << orderedFineGridPointsIds << std::endl;

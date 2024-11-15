@@ -340,6 +340,7 @@ bool Engine<CALIBRATOR>::allocateInputOutputTensors(bool &buffersResized)
           std::endl;
         m_prevTensorDims.push_back(tensorShape);
         cudaSafeCall(cudaFreeAsync(m_buffers[i], m_inferenceCudaStream));
+
         if (tensorType == TensorIOMode::kINPUT) {
             // Allocate memory for the input
             // Allocate enough to fit the max batch size (we could end up using less later)

@@ -16,7 +16,8 @@
         "hash_map": "cpp",
         "initializer_list": "cpp",
         "regex": "cpp",
-        "valarray": "cpp"
+        "valarray": "cpp",
+        "stdexcept": "cpp"
     },
     "sonarlint.pathToCompileCommands": "/home/ubuntu/900RobotCode/zebROS_ws/build/compile_commands.json"
 }

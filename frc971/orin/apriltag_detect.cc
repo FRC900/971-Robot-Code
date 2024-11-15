@@ -721,7 +721,7 @@ static void writeStage2Debug(cv::Mat &image,
 }
 
 template <size_t GRID_SIZE>
-void visualizeStage2(cv::Mat &image, const size_t outputHW,
+void visualizeStage2(cv::Mat &image, const int outputHW,
                      const std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> &result) {
   cv::Mat output(
       outputHW * 2,                                                // rows
@@ -792,7 +792,10 @@ void GpuDetector::DecodeTags() {
     }
   }
 
-  const auto tag_output = s_tag_decoder_.detectTags(ToGpuImage(gray_image_device_), filtered_rois);
+  // filtered_rois2.erase(filtered_rois2.begin(), filtered_rois2.begin() + 5);
+  // filtered_rois2.erase(filtered_rois2.end());
+  after_memcpy_gray_.Synchronize();
+  const auto tag_output = s_tag_decoder_.detectTags(ToGpuImage(gray_image_device_), filtered_rois2);
 
   cv::Mat stage2_debug_image = image.clone();
   visualizeStage2<6>(stage2_debug_image, 256, tag_output);
@@ -816,7 +819,6 @@ void GpuDetector::DecodeTags() {
 
   zarray_truncate(detections_, 0);
 
-  after_memcpy_gray_.Synchronize();
   image_u8_t im_orig{
       .width = static_cast<int32_t>(width_),
       .height = static_cast<int32_t>(original_height_),

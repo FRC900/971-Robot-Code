@@ -1,3 +1,7 @@
+#ifndef __global__
+#define __global__
+#endif
+
 #include "frc971/orin/cuda_utils.h"
 #include "frc971/orin/grid_prior.h"
 #include <cstdio>
