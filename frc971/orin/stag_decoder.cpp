@@ -31,7 +31,7 @@ STagDecoder<MARKER_DICT, GRID_SIZE>::STagDecoder(const MARKER_DICT &markerDict,
     m_engineInputs[0].emplace_back();
     for (auto &cf : m_confidenceFilters)
     {
-        cf.withConfidence(0.6f); // default min confidence for keypoints
+        cf.withConfidence(0.2f); // default min confidence for keypoints
     }
 }
 
@@ -188,41 +188,82 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
         if (trustFlag)
         {
             // Group nearby keypoints by taking the average of their locations weighted by confidence
+            // TODO : sigma should be configurable
             m_timing.start("decode_keypoint_group", m_decodeEngine->getCudaStream());
             m_keypointGrouper.compute(m_confidenceFilters[batchIdx].getOutput(), 12, 0.0, m_decodeEngine->getCudaStream());
             m_timing.end("decode_keypoint_group");
 
-            // Compute corner locations as offsets from the corner prior anchor points
-            // Do this here so the memcpy from the keypoint grouper above has time
-            // to possibly finish
-            m_timing.start("decode_corner_locations", m_decodeEngine->getCudaStream());
-            m_corners.compute(m_decodeEngine->getBufferByName("corner_locations_pred", batchIdx),
-                              m_stage2CornerPrior.getOutput(),
-                              0.05f,
-                              m_decodeEngine->getCudaStream());
-            m_timing.end("decode_corner_locations");
-
-            // Grab the host outputs of each of the above operations
-            m_timing.start("decode_keypoint_group_out", m_decodeEngine->getCudaStream());
-            const tcb::span<const Stage2KeypointGroup> hStage2KeypointGroup = m_keypointGrouper.getOutput();
-            for (const auto &k : hStage2KeypointGroup)
+            // Make sure there are enough valid keypoints to do anything with
+            // And make sure there are enough white blocks to be a reasonable 
+            // approximation of a valid tag
+            // Note, still need a later check after assigning keypoints to ground truth
+            // keypoint locations to make sure there aren't too many background points
+            // associated with ground truth keypoints
+            m_timing.start("decode_keypoint_group_trust", m_decodeEngine->getCudaStream());
+            const bool groupTrustFlag = m_keypointGroupTrust.check(m_keypointGrouper.getOutput(), 0.6f, 0.6f);
+            m_timing.end("decode_keypoint_group_trust");
+#ifdef DEBUG
+            std::cout << " batchIdx = " << batchIdx << " groupTrustFlag = " << (int)groupTrustFlag << std::endl;
+#endif
+            if (groupTrustFlag)
             {
-                stage2KeypointGroups.back().emplace_back(k);
-            }
-            m_timing.end("decode_keypoint_group_out");
+                // Compute corner locations as offsets from the corner prior anchor points
+                // Do this here so the memcpy from the keypoint grouper above has time
+                // to possibly finish
+                m_timing.start("decode_corner_locations", m_decodeEngine->getCudaStream());
+                m_corners.compute(m_decodeEngine->getBufferByName("corner_locations_pred", batchIdx),
+                                m_stage2CornerPrior.getOutput(),
+                                0.05f, // centerVariance - defined when training model so not configurable
+                                m_decodeEngine->getCudaStream());
+                m_timing.end("decode_corner_locations");
+                // TODO : check if corners form convex quadrilateral
 
-            m_timing.start("decode_corners_out", m_decodeEngine->getCudaStream());
-            const tcb::span<const float2> hStage2Corners = m_corners.getHostOutput();
-            std::copy(hStage2Corners.begin(), hStage2Corners.end(), stage2Corners.back().begin());
-            m_timing.end("decode_corners_out");
+                // Grab the host outputs of each of the above operations
+                m_timing.start("decode_keypoint_group_out", m_decodeEngine->getCudaStream());
+                const tcb::span<const Stage2KeypointGroup> hStage2KeypointGroup = m_keypointGrouper.getOutput();
+                for (const auto &k : hStage2KeypointGroup)
+                {
+                    stage2KeypointGroups.back().emplace_back(k);
+                }
+                m_timing.end("decode_keypoint_group_out");
+
+                m_timing.start("decode_corners_out", m_decodeEngine->getCudaStream());
+                const tcb::span<const float2> hStage2Corners = m_corners.getHostOutput();
+                std::copy(hStage2Corners.begin(), hStage2Corners.end(), stage2Corners.back().begin());
+                m_timing.end("decode_corners_out");
+            }
         }
     }
 }
+// TODOs
+//  - only run pass 2 on tags which pass a reasonable-ness test in pass 1
+//      not enough total foreground points - never seems to trigger, even on bad tags we get
+//         enough (wrong) keypoints with high confidence
+//      too many background points assigned to tag keypoints?
+//                     white foreground points in border region?
+//  - simplify assigning predicted points to tag ground truth coords
+//      do an optimal assignment pass on them?
+//      with distance threshold
+//      maybe pre-generate distance on GPU - would require unit tags copied to GPU memory
+// Verify all ids in a group are the same
+// - int8 quantization - save outputs of apriltag decoder detection and run trt on them
+//       quantized model never detects fg white keypoints?
+// - config values for min area, hamming distance, add more here :
+// - consider a cudagraph capturing the softmax - > keypoint detect -> trust graph
+//      would require a separate softmax and trust for each batch output since the buffers
+//      are different for each.
+// - find out optimal batch size - at some point the avg time/result will level out
+// - if that optimal size is low enough, create separate engines for each size and set them to use cudaGraphs
+//   along with separate optmiization profiles for each size.  I'm hoping the number is like 2 or 3, meaning the
+//   size doesn't explode the number of engines we need.
+// - confirm corner coords aren't adjusted for camera distortion
+// - pipeline inference of tag i+1 with cpu post proc of tag i (or s/tag/batch/g)
 
 template <class MARKER_DICT, size_t GRID_SIZE>
 std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_SIZE>::detectTags(const GpuImage<uint8_t> &detectInputs,
                                                                                                   const std::vector<std::array<cv::Point2d, 4>> &rois)
 {
+    ScopedEventTiming t(m_timing, "sTagDecoder_detectTags", m_decodeEngine->getCudaStream());
     // Array of tag corners detected in the input image
     std::vector<std::array<cv::Point2d, 4>> thisRois{rois};
     // Output of model inference on the extracted rois
@@ -243,9 +284,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
         const tcb::span<const std::array<cv::Point2d, 4>> thisRoiSpan{thisRois};
         // TODO - detect pass 1 candidates which are never going to work, filter them out
         //        instead of running pass 2 on them.
-        // Ideas for filters - 0 or 1 white foreground points
-        //                     white foreground points in border region
-        //                     too many background points assigned to tag keypoints
+        // Ideas for filters - too many background points assigned to tag keypoints
 
         // TODO - simplify assigning predicted points to tag ground truth coords
         //        do an optimal assignment pass on them?
@@ -267,6 +306,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                     ret.push_back(std::array<DecodedTag<GRID_SIZE>, 2>{});
                 }
                 ret[retIdx][iter].m_HCrop = m_decodeEngine->getH(ii);
+                // This will check if trust from runInference is valid?
                 ret[retIdx][iter].m_isValid = stage2KeypointGroups[retIdx].size() > 0;
 #ifdef DEBUG
                 std::cout << "iter = " << iter << " ret[" << retIdx << "][" << iter << "].m_isValid = " << ret[retIdx][iter].m_isValid << std::endl;

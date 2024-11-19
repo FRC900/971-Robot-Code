@@ -701,7 +701,7 @@ bool roi_points_too_close(const std::array<cv::Point2d, 4> &roi)
 }
 
 static cv::Mat getTag(const cv::Mat &image, const size_t outputHW,
-                      const cv::Mat H) {
+                      const cv::Mat &H) {
   cv::Mat tag;
   warpPerspective(image, tag, H, cv::Size(outputHW, outputHW));
   return tag;
@@ -711,7 +711,7 @@ template <size_t GRID_SIZE>
 static void writeStage2Debug(cv::Mat &image,
                              PointsAndIDs<GRID_SIZE + 2> keypointsAndIds,
                              std::array<cv::Point2d, 4> corners,
-                             const cv::Mat H,
+                             const cv::Mat &H,
                              const uint16_t tagId) {
   warpPerspectivePts(H, keypointsAndIds.m_point);
   for (size_t kp = 0; kp < keypointsAndIds.m_point.size(); kp++) {
@@ -761,8 +761,35 @@ void visualizeStage2(cv::Mat &image, const int outputHW,
   image = output;
 }
 
+void writePNG(const cv::Mat &image, const std::array<cv::Point2d, 4> &roi, int &counter) {
+  cv::Mat outputRoi(4, 2, CV_64FC1);
+  constexpr double borderRatio = 0.15;
+  constexpr int outputHW = 256;
+  double borderWidth = outputHW * borderRatio;
+  outputRoi.at<double>(0, 0) = borderWidth - 0.5;
+  outputRoi.at<double>(0, 1) = borderWidth - 0.5;
+  outputRoi.at<double>(1, 0) = outputHW - borderWidth - 0.5;
+  outputRoi.at<double>(1, 1) = borderWidth - 0.5;
+  outputRoi.at<double>(2, 0) = outputHW - borderWidth - 0.5;
+  outputRoi.at<double>(2, 1) = outputHW - borderWidth - 0.5;
+  outputRoi.at<double>(3, 0) = borderWidth - 0.5;
+  outputRoi.at<double>(3, 1) = outputHW - borderWidth - 0.5;
+  cv::Mat inputRoi(4, 2, CV_64FC1);
+  for (int i = 0; i < 4; i++) {
+    inputRoi.at<double>(i, 0) = roi[i].x;
+    inputRoi.at<double>(i, 1) = roi[i].y;
+  }
+  const cv::Mat H = cv::findHomography(inputRoi, outputRoi);
+  cv::Mat outImg(outputHW, outputHW, CV_8UC1);
+  cv::warpPerspective(image, outImg, H, cv::Size(outputHW, outputHW));
+  const std::string filename = "/tmp/tag" + std::to_string(counter++) + ".png";
+  cv::imwrite(filename, outImg);
+}
+
+int counter = 0;
 void GpuDetector::DecodeTags() {
 
+  // Grab corners from the detection results
   std::vector<std::array<cv::Point2d, 4>> rois;
   for (const auto &quad : quad_corners_host_) {
     rois.emplace_back();
@@ -781,10 +808,6 @@ void GpuDetector::DecodeTags() {
     }
     );
   }
-  cv::Mat image(original_height_, width_, CV_8UC1, const_cast<uint8_t *>(gray_image_host_ptr_));
-  cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);
-  // display_rois(image, rois, cv::Scalar(0, 128, 128));
-
   // Filter out triangle-like rois
   std::vector<std::array<cv::Point2d, 4>> filtered_rois;
   for (const auto &roi : rois) {
@@ -792,25 +815,46 @@ void GpuDetector::DecodeTags() {
       filtered_rois.push_back(roi);
     }
   }
-  // display_rois(image, filtered_rois, cv::Scalar(0, 255, 0));
-  // cv::imshow("rois", image);
 
   auto cross = [](const cv::Point2d &a, const cv::Point2d &b) {
     return a.x * b.y - a.y * b.x;
   };
   std::vector<std::array<cv::Point2d, 4>> filtered_rois2;
   for (const auto &roi: filtered_rois) {
-    auto area = 0.5 * fabs(cross(roi[0], roi[1]) + cross(roi[1], roi[2]) + cross(roi[2], roi[3]) + cross(roi[3], roi[0]));
-    std::cout << "Area: " << area << std::endl;
+    const auto area = 0.5 * fabs(cross(roi[0], roi[1]) + cross(roi[1], roi[2]) + cross(roi[2], roi[3]) + cross(roi[3], roi[0]));
+    // std::cout << "Area: " << area << std::endl;
     if (area > 500) {
       filtered_rois2.push_back(roi);
     }
   }
 
+  // Sort ends up with r[0] at top-right, but
+  // we want r[0] at top-left, so shift all elements
+  // up by 1, wrapping 3 back around to 0
+  // Could fix the sort with adding a multiple of PI/2 then fmod 2PI,
+  // but this swap is likely quicker anyway
+  for (auto &r : filtered_rois2) {
+    const auto t = r[3];
+    r[3] = r[2];
+    r[2] = r[1];
+    r[1] = r[0];
+    r[0] = t;
+    // const auto image = cv::Mat(original_height_, width_, CV_8UC1, const_cast<uint8_t *>(gray_image_host_ptr_));
+    // writePNG(image, r, counter);
+  }
+
+  if ((filtered_rois2.size() % 2) == 1) {
+    filtered_rois2.erase(filtered_rois2.end());
+  }
   // filtered_rois2.erase(filtered_rois2.begin(), filtered_rois2.begin() + 5);
   // filtered_rois2.erase(filtered_rois2.end());
   after_memcpy_gray_.Synchronize();
   const auto tag_output = s_tag_decoder_.detectTags(ToGpuImage(gray_image_device_), filtered_rois2);
+
+#if 0
+  // Debug viz
+  cv::Mat image(original_height_, width_, CV_8UC1, const_cast<uint8_t *>(gray_image_host_ptr_));
+  cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);
 
   cv::Mat stage2_debug_image = image.clone();
   visualizeStage2<6>(stage2_debug_image, 256, tag_output);
@@ -819,6 +863,9 @@ void GpuDetector::DecodeTags() {
   display_rois(image, filtered_rois2, cv::Scalar(0, 255, 0));
   cv::imshow("rois", image);
   cv::waitKey(0);
+  // end debug viz
+#endif
+
   size_t chunksize =
       1 + quad_corners_host_.size() /
               (APRILTAG_TASKS_PER_THREAD_TARGET * tag_detector_->nthreads);

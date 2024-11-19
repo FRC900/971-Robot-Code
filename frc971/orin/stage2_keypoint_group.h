@@ -34,7 +34,6 @@ public:
     friend __host__ std::ostream &operator<<(std::ostream &os, const Stage2KeypointGroup &kg)
     {
         os << "\tm_label = " << kg.m_label << std::endl;
-        os << "\tm_label = " << kg.m_label << std::endl;
         os << "\t\tm_score = " << kg.m_score << std::endl;
         os << "\t\tm_keypoint = " << kg.m_keypoint.x << ", " << kg.m_keypoint.y << std::endl;
         os << "\t\tm_score_sum = " << kg.m_score_sum << std::endl;

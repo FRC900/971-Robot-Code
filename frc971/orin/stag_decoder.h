@@ -18,6 +18,7 @@
 #include "frc971/orin/decoder_softmax.h"        // for DecoderSoftmax
 #include "frc971/orin/grid_prior.h"             // for GridPrior
 #include "frc971/orin/stage2_corners.h"         // for Stage2Corners
+#include "frc971/orin/stage2_keypoint_group_trust.h"  // for Stage2KeypointGroupTrust
 #include "frc971/orin/stage2_keypoint_trust.h"  // for Stage2KeypointTrust
 #include "frc971/orin/suppress_and_average_keypoints.h"  // for SuppressAndAverageKeypoints
 #include "gpu_apriltag/span.hpp"                         // for span
@@ -64,7 +65,7 @@ public:
 
 private:
     // TODO - not sure how configurable this needs to be
-    static constexpr size_t m_maxBatchSize = 4;
+    static constexpr size_t m_maxBatchSize = 1;
 
     void runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroupss,
                       std::vector<std::array<float2, 4>> &stage2Corners,
@@ -92,6 +93,7 @@ private:
     // cudaGraphs for each batch's confidence calcs.
     std::array<ConfidenceFilter<Stage2Keypoint, const tcb::span<const GridPriorValue> &, DecoderPredicate>, m_maxBatchSize> m_confidenceFilters;
     Stage2KeypointTrust m_keypointTrust;
+    Stage2KeypointGroupTrust m_keypointGroupTrust;
     SuppressAndAverageKeypoints<Stage2Keypoint, Stage2KeypointGroup> m_keypointGrouper;
 
     Stage2Corners m_corners;

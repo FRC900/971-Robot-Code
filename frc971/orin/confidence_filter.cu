@@ -15,7 +15,6 @@ ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::ConfidenceFilter(void)
 template <class OUTPUT, class GRID_DIM, class PREDICATE>
 ConfidenceFilter<OUTPUT, GRID_DIM, PREDICATE>::~ConfidenceFilter(void)
 {
-    std::cout << "ConfidenceFilter::~ConfidenceFilter" << std::endl;
     cudaSafeCall(cudaFree(m_dOutput));
     cudaSafeCall(cudaFreeHost(m_hOutputCountPtr));
     cudaSafeCall(cudaFree(m_dBlocksCount));

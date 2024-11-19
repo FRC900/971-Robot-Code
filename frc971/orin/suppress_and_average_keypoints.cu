@@ -129,7 +129,7 @@ void SuppressAndAverageKeypoints<INPUT, OUTPUT>::compute(const tcb::span<const I
         cudaSafeCall(cudaMemcpyAsync(m_hOutputLengthPtr, m_dOutputLengthPtr, sizeof(*m_hOutputLengthPtr), cudaMemcpyDeviceToHost, cudaStream));
         // inputCount is small enough that it seems quicker to unconditionally queue this up here
         // rather than wait for output count to get back to the host and then queue up a shorter sized copy
-        cudaSafeCall(cudaMemcpyAsync(m_hOutput, m_dOutput, m_inputCount * sizeof(OUTPUT), cudaMemcpyDeviceToHost, cudaStream));
+        cudaSafeCall(cudaMemcpyAsync(m_hOutput, m_dOutput, input.size() * sizeof(OUTPUT), cudaMemcpyDeviceToHost, cudaStream));
     }
     else
     {
@@ -151,7 +151,6 @@ void SuppressAndAverageKeypoints<INPUT, OUTPUT>::compute(const tcb::span<const I
     }
 #endif
 }
-
 
 template <class INPUT, class OUTPUT>
 const tcb::span<const OUTPUT> SuppressAndAverageKeypoints<INPUT, OUTPUT>::getOutput()

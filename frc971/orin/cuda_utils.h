@@ -9,6 +9,8 @@
 
 void cudaSafeCallWrapper(cudaError err, const char* file, const int line);
 
-inline __device__ __host__ uint32_t iDivUp( uint32_t a, uint32_t b )  		{ return (a % b != 0) ? (a / b + 1) : (a / b); }
+inline __device__ __host__ uint32_t iDivUp(uint32_t a, uint32_t b) {
+  return (a % b != 0) ? (a / b + 1) : (a / b);
+}
 
 #endif

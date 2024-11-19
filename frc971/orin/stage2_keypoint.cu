@@ -23,7 +23,8 @@ __device__ void Stage2Keypoint::copyInto(const float *confidences,
 
 __device__ bool Stage2Keypoint::check(const Stage2Keypoint &otherIn, int x, int y, const float sigma, const float min_cos) const
 {
-    if (hypotf(m_keypointCand.x - otherIn.m_keypointCand.x, m_keypointCand.y - otherIn.m_keypointCand.y) > sigma)
+    if ((m_label != otherIn.m_label) ||
+        (hypotf(m_keypointCand.x - otherIn.m_keypointCand.x, m_keypointCand.y - otherIn.m_keypointCand.y) > sigma))
     {
         //if (y == 0)
         //printf("false : x = %d, y = %d, kp = %f %f, otherKp = %f %f, signma = %f\n", x, y, m_keypointCand.x, m_keypointCand.y, otherIn.m_keypointCand.x, otherIn.m_keypointCand.y, sigma);
