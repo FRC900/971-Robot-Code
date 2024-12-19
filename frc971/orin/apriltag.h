@@ -8,7 +8,6 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #include "frc971/orin/apriltag_input_format.h"
-#include "frc971/orin/camera_matrix.h"
 #include "frc971/orin/cuda.h"
 #include "frc971/orin/cuda_event_timing.h"
 #include "frc971/orin/gpu_image.h"

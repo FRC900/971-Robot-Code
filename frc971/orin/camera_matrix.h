@@ -17,6 +17,11 @@ struct DistCoeffs {
   double p1;
   double p2;
   double k3;
+  double k4;
+  double k5;
+  double k6;
+  // Are we using 5 or 8 parameter model?
+  int num_params;
 };
 }
 

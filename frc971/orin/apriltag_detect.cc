@@ -29,6 +29,7 @@
 #include "aos/time/time.h"
 #include "frc971/orin/apriltag.h"
 #include "frc971/orin/apriltag_input_format.h"
+#include "frc971/orin/camera_matrix.h"
 #include "frc971/orin/labeling_allegretti_2019_BKE.h"
 #include "frc971/orin/threshold.h"
 
