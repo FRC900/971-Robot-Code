@@ -146,8 +146,29 @@ class GpuMemory {
   GpuMemory(const GpuMemory &&) noexcept = delete;
   GpuMemory &operator=(const GpuMemory &&) noexcept = delete;
 
+  // Create an alias to an already allocated GPU memory block.
+  // This is useful for cases where operations on memory are a no-op
+  //   for certain input types - for example, for mono input imnages,
+  //   the GPU "color" image is the same as the one converted to grayscale.
+  GpuMemory &operator=(const GpuMemory &other) {
+    // If we currently own our memory, free it.
+    if (owns_memory_) {
+      CHECK_CUDA(cudaFree(memory_));
+    }
+
+    // Copy the memory pointer and size, making
+    // this an alias to the input GpuMemory object's data.
+    memory_ = other.memory_;
+    size_ = other.size_;
+    owns_memory_ = false;
+
+    return *this;
+  }
+
   virtual ~GpuMemory() {
-    CHECK_CUDA(cudaFree(memory_));
+    if (owns_memory_) {
+      CHECK_CUDA(cudaFree(memory_));
+    }
   }
 
   // Returns the device pointer to the memory.
@@ -234,6 +255,7 @@ class GpuMemory {
  private:
   T *memory_;
   size_t size_;
+  bool owns_memory_{true};
 };
 
 // Synchronizes and CHECKs for success the last CUDA operation.
