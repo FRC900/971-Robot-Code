@@ -35,7 +35,7 @@ void DecoderEngineCalibrator::blobFromGpuImageWrappers(const std::vector<GpuImag
 DecoderEngine::DecoderEngine(const Options &options)
     : Engine(options)
 {
-    setUseCudaGraph(false);
+    setUseCudaGraph(true);
     // Set this up as pinned memory so async copy of it is actually async
     m_hH.resize(m_options.maxBatchSize);
     for (int32_t i = 0; i < m_options.maxBatchSize; i++)

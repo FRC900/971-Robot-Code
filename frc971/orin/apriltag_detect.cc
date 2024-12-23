@@ -832,7 +832,7 @@ void GpuDetector::DecodeTags() {
   // Sort ends up with r[0] at top-right, but
   // we want r[0] at top-left, so shift all elements
   // up by 1, wrapping 3 back around to 0
-  // Could fix the sort with adding a multiple of PI/2 then fmod 2PI,
+  // Could fix the sort with adding a multiple of PI/2 then fmod 2PI?
   // but this swap is likely quicker anyway
   for (auto &r : filtered_rois2) {
     const auto t = r[3];
@@ -852,7 +852,7 @@ void GpuDetector::DecodeTags() {
   after_memcpy_gray_.Synchronize();
   const auto tag_output = s_tag_decoder_.detectTags(ToGpuImage(gray_image_device_), filtered_rois2);
 
-#if 0
+#if 1
   // Debug viz
   cv::Mat image(original_height_, width_, CV_8UC1, const_cast<uint8_t *>(gray_image_host_ptr_));
   cv::cvtColor(image, image, cv::COLOR_GRAY2BGR);

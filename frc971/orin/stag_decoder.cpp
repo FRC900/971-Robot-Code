@@ -17,27 +17,15 @@
 // #define DEBUG
 #include "frc971/orin/debug.h"
 
-template <class MARKER_DICT, size_t GRID_SIZE>
-STagDecoder<MARKER_DICT, GRID_SIZE>::STagDecoder(const MARKER_DICT &markerDict,
-                                                 const frc971::apriltag::CameraMatrix &cameraMatrix,
-                                                 const frc971::apriltag::DistCoeffs &distCoeffs,
-                                                 Timings &timing)
-    : m_markerDict(markerDict)
-    , m_timing{timing}
+STagDecoderGPUWorker::STagDecoderGPUWorker(const std::string &modelPath,
+                                           const std::string &onnxModelFilename,
+                                           const int32_t batchSize,
+                                           Timings &timing)
+    : m_timing{timing}
+    , m_confidenceFilters{batchSize}
 {
-    m_cameraMatrix = (cv::Mat_<double>(3, 3) << cameraMatrix.fx, 0, cameraMatrix.cx, 0, cameraMatrix.fy, cameraMatrix.cy, 0, 0, 1);
-    m_distCoeffs = (cv::Mat_<double>(1, 8) << distCoeffs.k1, distCoeffs.k2, distCoeffs.p1, distCoeffs.p2, distCoeffs.k3, distCoeffs.k4, distCoeffs.k5, distCoeffs.k6);
     m_engineInputs.emplace_back();
     m_engineInputs[0].emplace_back();
-    for (auto &cf : m_confidenceFilters)
-    {
-        cf.withConfidence(0.2f); // default min confidence for keypoints
-    }
-}
-
-template <class MARKER_DICT, size_t GRID_SIZE>
-void STagDecoder<MARKER_DICT, GRID_SIZE>::initEngine(const std::string &modelPath, const std::string &onnxModelFilename)
-{
     if (const std::string onnxModelPath = modelPath + "/" + onnxModelFilename;
         !Util::doesFileExist(onnxModelPath))
     {
@@ -47,14 +35,14 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::initEngine(const std::string &modelPat
     Options decodeOptions;
     // Specify what precision to use for inference
     // FP16 is approximately twice as fast as FP32.
-    decodeOptions.precision = Precision::FP16;
+    decodeOptions.precision = Precision::INT8;
     // If using INT8 precision, must specify path to directory containing calibration data.
     decodeOptions.calibrationDataDirectoryPath = "/home/ubuntu";
     // If the model does not support dynamic batch size, then the below two parameters must be set to 1.
     // Specify the batch size to optimize for.
-    decodeOptions.optBatchSize = m_maxBatchSize;
+    decodeOptions.optBatchSize = batchSize;
     // Specify the maximum batch size we plan on running.
-    decodeOptions.maxBatchSize = m_maxBatchSize;
+    decodeOptions.maxBatchSize = batchSize;
     m_decodeEngine = std::make_unique<DecoderEngine>(decodeOptions);
     // Build the onnx model into a TensorRT engine file.
     if (!m_decodeEngine->build(modelPath, onnxModelFilename))
@@ -66,35 +54,25 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::initEngine(const std::string &modelPat
     {
         throw std::runtime_error("Unable to load TRT engine.");
     }
-}
 
-#ifdef DEBUG
-#include <frc971/orin/cuda_utils.h>
-static void dump_output(const std::string &filename, const float *dData, size_t size, cudaStream_t stream)
-{
-    cudaSafeCall(cudaStreamSynchronize(stream));
-    auto hData = std::make_unique<float[]>(size);
-    cudaSafeCall(cudaMemcpy(hData.get(), dData, size * sizeof(float), cudaMemcpyDeviceToHost));
-    std::ofstream os(filename);
-    for (size_t i = 0; i < size; i++)
+    for (auto &cf : m_confidenceFilters)
     {
-        os << i << ", " << hData[i] << std::endl;
+        cf.withConfidence(0.2f); // default min confidence for keypoints
     }
 }
-#endif
-// Run 1 batch of inference.
-// Batch size is inferred from rois.size()
-// append results to vector of Stage2Keypoint vectors, 1 per input RoI
-// and the corresponding corners vector of Stage2Keypoint vectors, 1 per input RoI 
-// Note : these accmulate values over each batch of the input, so the caller
-// is responsible for clearing them if needed.
-// (although TODO : those might be duplicates of data in the KeyPoints)
-template <class MARKER_DICT, size_t GRID_SIZE>
-void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroups,
-                                                       std::vector<std::array<float2, 4>> &stage2Corners,
-                                                       const GpuImage<uint8_t> &detectInputs,
-                                                       const tcb::span<const std::array<cv::Point2d, 4>> &rois)
+#include <ros/console.h>
+
+void STagDecoderGPUWorker::runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroups,
+                                        std::vector<std::array<float2, 4>> &stage2Corners,
+                                        std::vector<cv::Mat> &Hs,
+                                        const GpuImage<uint8_t> &detectInputs,
+                                        const tcb::span<const std::array<cv::Point2d, 4>> &rois)
 {
+    ROS_WARN("runInference");
+    for (const auto &roi : rois)
+    {
+        ROS_INFO_STREAM("roi = " << roi[0] << " " << roi[1] << " " << roi[2] << " " << roi[3]);
+    }
     // Run a batch of results in one inference pass
     ScopedEventTiming t(m_timing, "sTagDecoder_runInference", m_decodeEngine->getCudaStream());
     m_timing.start("setROIs", m_decodeEngine->getCudaStream());
@@ -185,6 +163,7 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
 #endif
         stage2KeypointGroups.emplace_back();
         stage2Corners.emplace_back();
+        Hs.emplace_back(m_decodeEngine->getH(batchIdx));
         if (trustFlag)
         {
             // Group nearby keypoints by taking the average of their locations weighted by confidence
@@ -235,6 +214,71 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
         }
     }
 }
+
+
+ushort2 STagDecoderGPUWorker::getModelSize(void) const
+{
+    const auto inputDim = m_decodeEngine->getInputDims()[0];
+    return ushort2{inputDim.d[2], inputDim.d[3]};
+}
+
+cudaStream_t STagDecoderGPUWorker::getCudaStream(void)
+{
+    return m_decodeEngine->getCudaStream();
+}
+
+template <class MARKER_DICT, size_t GRID_SIZE>
+STagDecoder<MARKER_DICT, GRID_SIZE>::STagDecoder(const MARKER_DICT &markerDict,
+                                                 const frc971::apriltag::CameraMatrix &cameraMatrix,
+                                                 const frc971::apriltag::DistCoeffs &distCoeffs,
+                                                 Timings &timing)
+    : m_markerDict(markerDict)
+    , m_timing{timing}
+{
+    m_cameraMatrix = (cv::Mat_<double>(3, 3) << cameraMatrix.fx, 0, cameraMatrix.cx, 0, cameraMatrix.fy, cameraMatrix.cy, 0, 0, 1);
+    m_distCoeffs = (cv::Mat_<double>(1, 8) << distCoeffs.k1, distCoeffs.k2, distCoeffs.p1, distCoeffs.p2, distCoeffs.k3, distCoeffs.k4, distCoeffs.k5, distCoeffs.k6);
+}
+
+template <class MARKER_DICT, size_t GRID_SIZE>
+void STagDecoder<MARKER_DICT, GRID_SIZE>::initEngine(const std::string &modelPath, const std::string &onnxModelFilename)
+{
+    for (size_t i = 0; i < m_maxBatchSize; i++)
+    {
+        m_gpuWorkers[i] = std::make_unique<STagDecoderGPUWorker>(modelPath, onnxModelFilename, i + 1, m_timing);
+    }
+}
+
+#ifdef DEBUG
+#include <frc971/orin/cuda_utils.h>
+static void dump_output(const std::string &filename, const float *dData, size_t size, cudaStream_t stream)
+{
+    cudaSafeCall(cudaStreamSynchronize(stream));
+    auto hData = std::make_unique<float[]>(size);
+    cudaSafeCall(cudaMemcpy(hData.get(), dData, size * sizeof(float), cudaMemcpyDeviceToHost));
+    std::ofstream os(filename);
+    for (size_t i = 0; i < size; i++)
+    {
+        os << i << ", " << hData[i] << std::endl;
+    }
+}
+#endif
+// Run 1 batch of inference.
+// Batch size is inferred from rois.size()
+// append results to vector of Stage2Keypoint vectors, 1 per input RoI
+// and the corresponding corners vector of Stage2Keypoint vectors, 1 per input RoI 
+// Note : these accmulate values over each batch of the input, so the caller
+// is responsible for clearing them if needed.
+// (although TODO : those might be duplicates of data in the KeyPoints)
+template <class MARKER_DICT, size_t GRID_SIZE>
+void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroups,
+                                                       std::vector<std::array<float2, 4>> &stage2Corners,
+                                                       std::vector<cv::Mat> &Hs,
+                                                       const GpuImage<uint8_t> &detectInputs,
+                                                       const tcb::span<const std::array<cv::Point2d, 4>> &rois)
+{
+    m_gpuWorkers[rois.size() - 1]->runInference(stage2KeypointGroups, stage2Corners, Hs, detectInputs, rois);
+}
+
 // TODOs
 //  - only run pass 2 on tags which pass a reasonable-ness test in pass 1
 //      not enough total foreground points - never seems to trigger, even on bad tags we get
@@ -246,13 +290,12 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
 //      with distance threshold
 //      maybe pre-generate distance on GPU - would require unit tags copied to GPU memory
 // Verify all ids in a group are the same
-// - int8 quantization - save outputs of apriltag decoder detection and run trt on them
-//       quantized model never detects fg white keypoints?
 // - config values for min area, hamming distance, add more here :
 // - consider a cudagraph capturing the softmax - > keypoint detect -> trust graph
 //      would require a separate softmax and trust for each batch output since the buffers
 //      are different for each.
 // - find out optimal batch size - at some point the avg time/result will level out
+//      1, 2, 3 show useful speedups. 4 is very likely not that big of an improvement
 // - if that optimal size is low enough, create separate engines for each size and set them to use cudaGraphs
 //   along with separate optmiization profiles for each size.  I'm hoping the number is like 2 or 3, meaning the
 //   size doesn't explode the number of engines we need.
@@ -263,12 +306,13 @@ template <class MARKER_DICT, size_t GRID_SIZE>
 std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_SIZE>::detectTags(const GpuImage<uint8_t> &detectInputs,
                                                                                                   const std::vector<std::array<cv::Point2d, 4>> &rois)
 {
-    ScopedEventTiming t(m_timing, "sTagDecoder_detectTags", m_decodeEngine->getCudaStream());
+    ScopedEventTiming t(m_timing, "sTagDecoder_detectTags", m_gpuWorkers[0]->getCudaStream());
     // Array of tag corners detected in the input image
     std::vector<std::array<cv::Point2d, 4>> thisRois{rois};
     // Output of model inference on the extracted rois
     std::vector<std::vector<Stage2KeypointGroup>> stage2KeypointGroups;
     std::vector<std::array<float2, 4>> stage2Corners;
+    std::vector<cv::Mat> Hs;
 
     // Decoded tag info. 2 iterations per tag to refine corners
     std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> ret;
@@ -281,6 +325,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
         size_t retIdx = 0;
         stage2KeypointGroups.clear();
         stage2Corners.clear();
+        Hs.clear();
         const tcb::span<const std::array<cv::Point2d, 4>> thisRoiSpan{thisRois};
         // TODO - detect pass 1 candidates which are never going to work, filter them out
         //        instead of running pass 2 on them.
@@ -297,7 +342,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
         {
             const size_t thisBatchSize = std::min(rois.size() - batchStart, m_maxBatchSize);
             auto thisRoiSubspan = thisRoiSpan.subspan(batchStart, thisBatchSize);
-            runInference(stage2KeypointGroups, stage2Corners, detectInputs, thisRoiSubspan);
+            runInference(stage2KeypointGroups, stage2Corners, Hs, detectInputs, thisRoiSubspan);
 
             for (size_t ii = 0; ii < thisRoiSubspan.size(); ii++)
             {
@@ -305,7 +350,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                 {
                     ret.push_back(std::array<DecodedTag<GRID_SIZE>, 2>{});
                 }
-                ret[retIdx][iter].m_HCrop = m_decodeEngine->getH(ii);
+                ret[retIdx][iter].m_HCrop = Hs[retIdx];
                 // This will check if trust from runInference is valid?
                 ret[retIdx][iter].m_isValid = stage2KeypointGroups[retIdx].size() > 0;
 #ifdef DEBUG
@@ -316,7 +361,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
 #ifdef DEBUG
                     std::cout << "MatchFineGrid : ii = " << ii << " retIdx = " << retIdx << std::endl;
 #endif
-                    m_timing.start("decode_matchfinegrid", m_decodeEngine->getCudaStream());
+                    m_timing.start("decode_matchfinegrid", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
                     double matchRatio;
                     constexpr auto FINE_GRID_SIZE = MARKER_DICT::getGridSize() + 2;
                     PointsAndIDs <FINE_GRID_SIZE> orderedFineGridPointsIds;
@@ -326,7 +371,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                     m_markerDict.getUnitTagTemplate().matchFineGrid(matchRatio,
                                                                     orderedFineGridPointsIds,
                                                                     stage2KeypointGroups[retIdx],
-                                                                    m_decodeEngine->getH(ii),
+                                                                    Hs[retIdx],
                                                                     stage2Corners[retIdx],
                                                                     m_cameraMatrix, // cameraMatrix
                                                                     m_distCoeffs);  // distCoeffs
@@ -341,14 +386,14 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
                         //fillEmptyIds(orderedFineGridPointsIds, stage2KeypointGroups[retIdx]);
                         // m_timing.end("decode_fillemptyids");
 
-                        m_timing.start("decode_updatecornersinimage", m_decodeEngine->getCudaStream());
+                        m_timing.start("decode_updatecornersinimage", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
                         const auto roiUpdated = m_markerDict.getUnitTagTemplate().updateCornersInImage(orderedFineGridPointsIds,
-                                                                                                       m_decodeEngine->getH(ii),
+                                                                                                       Hs[retIdx],
                                                                                                        m_cameraMatrix,
                                                                                                        m_distCoeffs);
                         m_timing.end("decode_updatecornersinimage");
 
-                        m_timing.start("decode_getmainindex", m_decodeEngine->getCudaStream());
+                        m_timing.start("decode_getmainindex", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
                         thisRois[retIdx] = roiUpdated;
                         ret[retIdx][iter].m_roi = roiUpdated;
 
@@ -366,7 +411,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
 #endif
                         m_timing.end("decode_getmainindex");
 
-                        m_timing.start("decode_reorderpointswithmainidx", m_decodeEngine->getCudaStream());
+                        m_timing.start("decode_reorderpointswithmainidx", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
                         m_markerDict.getUnitTagTemplate().reorderPointsWithMainIdx(ret[retIdx][iter].m_keypointsWithIds, // [re] orderedFineGridPointsIds
                                                                                    ret[retIdx][iter].m_mainIdx,
                                                                                    orderedFineGridPointsIds);
@@ -398,7 +443,7 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
     }
     return ret;
 }
-
+#if 0
 template <class MARKER_DICT, size_t GRID_SIZE>
 void STagDecoder<MARKER_DICT, GRID_SIZE>::fillEmptyIds(PointsAndIDs<GRID_SIZE + 2> &orderedFineGridPointsIds,
                                                        const tcb::span<const Stage2KeypointGroup> &fineGridPointsWithIdsCandidates) const
@@ -422,6 +467,7 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::fillEmptyIds(PointsAndIDs<GRID_SIZE + 
         }
     }
 }
+#endif
 
 template <class MARKER_DICT, size_t GRID_SIZE>
 void STagDecoder<MARKER_DICT, GRID_SIZE>::setMinGridMatchRatio(const double minGridMatchRatio)
@@ -433,19 +479,6 @@ double STagDecoder<MARKER_DICT, GRID_SIZE>::getMinGridMatchRatio(void) const
 {
     return m_minGridMatchRatio;
 } 
-
-template <class MARKER_DICT, size_t GRID_SIZE>
-ushort2 STagDecoder<MARKER_DICT, GRID_SIZE>::getModelSize(void) const
-{
-    auto inputDim = m_decodeEngine->getInputDims()[0];
-    return ushort2{inputDim.d[2], inputDim.d[3]};
-}
-
-template <class MARKER_DICT, size_t GRID_SIZE>
-cudaStream_t STagDecoder<MARKER_DICT, GRID_SIZE>::getCudaStream(void)
-{
-    return m_decodeEngine->getCudaStream();
-}
 
 #include "frc971/orin/marker_dict.h"
 // template class STagDecoder<ArucoMarkerDict<4>, 4>;

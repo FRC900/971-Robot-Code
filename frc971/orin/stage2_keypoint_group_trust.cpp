@@ -46,8 +46,8 @@ bool Stage2KeypointGroupTrust::check(const tcb::span<const Stage2KeypointGroup> 
   for (size_t i = 1; i < stage2keypointGroups.size(); i++) {
     counter += GroupTrustCounters(stage2keypointGroups[i].m_score, stage2keypointGroups[i].m_label, keypointGroupConfidence);
   }
-  // std::cout << "scoreSum = " << counter.scoreSum << " fgWhiteCount = " << counter.fgWhiteCount << " fgBlackCount = " << counter.fgBlackCount << " size = " << stage2keypointGroups.size() << std::endl;
-  if ((counter.scoreSum / stage2keypointGroups.size()) < trustConfidence) {
+  std::cout << "scoreSum = " << counter.scoreSum << " scoreSum/size = " << counter.scoreSum / stage2keypointGroups.size() <<" fgWhiteCount = " << counter.fgWhiteCount << " fgBlackCount = " << counter.fgBlackCount << " size = " << stage2keypointGroups.size() << std::endl;
+  if ((counter.scoreSum / static_cast<float>(stage2keypointGroups.size())) < trustConfidence) {
     return false;
   }
   if (counter.fgWhiteCount <= 4) {
