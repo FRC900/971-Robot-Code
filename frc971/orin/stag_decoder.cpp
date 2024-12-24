@@ -55,18 +55,16 @@ STagDecoderGPUWorker::STagDecoderGPUWorker(const std::string &modelPath,
         throw std::runtime_error("Unable to load TRT engine.");
     }
 
-    for (auto &cf : m_confidenceFilters)
-    {
-        cf.withConfidence(0.2f); // default min confidence for keypoints
-    }
+    setConfidence(0.2f);
 }
+
 #include <ros/console.h>
 
 void STagDecoderGPUWorker::runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroups,
                                         std::vector<std::array<float2, 4>> &stage2Corners,
                                         std::vector<cv::Mat> &Hs,
                                         const GpuImage<uint8_t> &detectInputs,
-                                        const tcb::span<const std::array<cv::Point2d, 4>> &rois)
+                                        const std::vector<std::array<cv::Point2d, 4>> &rois)
 {
     ROS_WARN("runInference");
     for (const auto &roi : rois)
@@ -219,12 +217,20 @@ void STagDecoderGPUWorker::runInference(std::vector<std::vector<Stage2KeypointGr
 ushort2 STagDecoderGPUWorker::getModelSize(void) const
 {
     const auto inputDim = m_decodeEngine->getInputDims()[0];
-    return ushort2{inputDim.d[2], inputDim.d[3]};
+    return ushort2{static_cast<ushort>(inputDim.d[2]), static_cast<ushort>(inputDim.d[3])};
 }
 
 cudaStream_t STagDecoderGPUWorker::getCudaStream(void)
 {
     return m_decodeEngine->getCudaStream();
+}
+
+void STagDecoderGPUWorker::setConfidence(const float confidence)
+{
+    for (auto &cf : m_confidenceFilters)
+    {
+        cf.withConfidence(confidence);
+    }
 }
 
 template <class MARKER_DICT, size_t GRID_SIZE>
@@ -269,12 +275,13 @@ static void dump_output(const std::string &filename, const float *dData, size_t 
 // Note : these accmulate values over each batch of the input, so the caller
 // is responsible for clearing them if needed.
 // (although TODO : those might be duplicates of data in the KeyPoints)
+// TODO : is this 1 line function really needed?
 template <class MARKER_DICT, size_t GRID_SIZE>
 void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroups,
                                                        std::vector<std::array<float2, 4>> &stage2Corners,
                                                        std::vector<cv::Mat> &Hs,
                                                        const GpuImage<uint8_t> &detectInputs,
-                                                       const tcb::span<const std::array<cv::Point2d, 4>> &rois)
+                                                       const std::vector<std::array<cv::Point2d, 4>> &rois)
 {
     m_gpuWorkers[rois.size() - 1]->runInference(stage2KeypointGroups, stage2Corners, Hs, detectInputs, rois);
 }
@@ -303,13 +310,110 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::runInference(std::vector<std::vector<S
 // - pipeline inference of tag i+1 with cpu post proc of tag i (or s/tag/batch/g)
 
 template <class MARKER_DICT, size_t GRID_SIZE>
-std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_SIZE>::detectTags(const GpuImage<uint8_t> &detectInputs,
+void STagDecoder<MARKER_DICT, GRID_SIZE>::cpuPostProcess(DecodedTag<GRID_SIZE> &result, 
+                                                         const std::vector<Stage2KeypointGroup> &stage2KeypointGroups,
+                                                         const std::array<float2, 4> &stage2Corners,
+                                                         const cv::Mat &Hs,
+                                                         cudaStream_t stream)
+{
+
+
+    result.m_HCrop = Hs;
+    // This will check if trust from runInference is valid?
+    result.m_isValid = !stage2KeypointGroups.empty();
+    if (!result.m_isValid)
+    {
+        result.m_tagId = -1;
+        return;
+    }
+
+    m_timing.start("decode_matchfinegrid", stream);
+    double matchRatio;
+    constexpr auto FINE_GRID_SIZE = MARKER_DICT::getGridSize() + 2;
+    PointsAndIDs <FINE_GRID_SIZE> orderedFineGridPointsIds;
+    // Assign the points detected in the crop to actual grid
+    // points in the proposed tag. This is done by matching the
+    // detected keypoints to the nearest grid points in the tag
+    m_markerDict.getUnitTagTemplate().matchFineGrid(matchRatio,
+                                                    orderedFineGridPointsIds,
+                                                    stage2KeypointGroups,
+                                                    Hs,
+                                                    stage2Corners,
+                                                    m_cameraMatrix, // cameraMatrix
+                                                    m_distCoeffs);  // distCoeffs
+    m_timing.end("decode_matchfinegrid");
+
+#ifdef DEBUG
+    std::cout << "matchRatio = " << matchRatio << " m_minGridMatchRatio " << m_minGridMatchRatio << std::endl;
+#endif
+    if (matchRatio > m_minGridMatchRatio)
+    {
+        // m_timing.start("decode_fillemptyids", m_decodeEngine->getCudaStream());
+        //fillEmptyIds(orderedFineGridPointsIds, stage2KeypointGroups[retIdx]);
+        // m_timing.end("decode_fillemptyids");
+
+        // Adjust the corners of the tag using the difference between the tag keypoints and the
+        // ideal keypoints in the tag template. Use this roi as the input to the 2nd pass
+        // of inference and decoding.
+        m_timing.start("decode_updatecornersinimage", stream);
+        result.m_roi = m_markerDict.getUnitTagTemplate().updateCornersInImage(orderedFineGridPointsIds,
+                                                                              Hs,
+                                                                              m_cameraMatrix,
+                                                                              m_distCoeffs);
+        m_timing.end("decode_updatecornersinimage");
+
+        m_timing.start("decode_getmainindex", stream);
+
+        int hammingDist = 2; // TODO - configurable, dynamic reconfig potential
+
+        // Decode tag bits into a tagID and binaryID
+        // Main index is the rotation of the tag (in 90* increments), e.g. 0 is upright, 1 is 90* clockwise, etc.
+        m_markerDict.getMainIdx(result.m_mainIdx,
+                                result.m_tagId,
+                                result.m_binaryId,
+                                orderedFineGridPointsIds.m_id,
+                                hammingDist);
+        m_timing.end("decode_getmainindex");
+
+        m_timing.start("decode_reorderpointswithmainidx", stream);
+        m_markerDict.getUnitTagTemplate().reorderPointsWithMainIdx(result.m_keypointsWithIds, // [re] orderedFineGridPointsIds
+                                                                   result.m_mainIdx,
+                                                                   orderedFineGridPointsIds);
+        warpPerspectivePts(result.m_HCrop.inv(), result.m_keypointsWithIds.m_point);
+        m_timing.end("decode_reorderpointswithmainidx");
+#ifdef DEBUG
+        std::cout << "mainIdx = " << result.m_mainIdx << " tagId = " << result.m_tagId << std::endl;
+        std::cout << "orderedFineGripPointsIds" << std::endl
+                    << orderedFineGridPointsIds << std::endl;
+        std::cout << "result.m_keypointsWithIds.m_point" << std::endl
+                    << result.m_keypointsWithIds << std::endl;
+        for (const auto &kg : stage2KeypointGroups)
+        {
+            kg.print();
+        }
+        for (const auto &c : stage2Corners)
+        {
+            std::cout << c.x << " " << c.y << std::endl;
+        }
+#endif
+    }
+    else
+    {
+        result.m_isValid = false;
+    }
+}
+
+
+// Run tag decoding on a set of tag proproals from the input image.  The input
+// image is expected to be a 1 channel mono grayscale image in GPU memory.
+// roi is a vector of 4 points defining the corners of the tag in the image
+template <class MARKER_DICT, size_t GRID_SIZE>
+std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_SIZE>::decodeTags(const GpuImage<uint8_t> &detectInputs,
                                                                                                   const std::vector<std::array<cv::Point2d, 4>> &rois)
 {
     ScopedEventTiming t(m_timing, "sTagDecoder_detectTags", m_gpuWorkers[0]->getCudaStream());
-    // Array of tag corners detected in the input image
-    std::vector<std::array<cv::Point2d, 4>> thisRois{rois};
-    // Output of model inference on the extracted rois
+
+    // Outputs of model inference on the extracted rois
     std::vector<std::vector<Stage2KeypointGroup>> stage2KeypointGroups;
     std::vector<std::array<float2, 4>> stage2Corners;
     std::vector<cv::Mat> Hs;
@@ -317,130 +421,86 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
     // Decoded tag info. 2 iterations per tag to refine corners
     std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> ret;
 
-    for (size_t iter = 0; iter < 2; iter++)
+    // Run two iteration of decoding. The first uses the tag corners generated
+    // by the tag detector.  The second iteration refines each tag's corners
+    // using the difference between the detected tag keypoints and the 
+    // tag template keypoints.  The tag template keypoints are the ideal
+    // locations of the tag keypoints in a perfect tag detection.
+
+    // TODO - detect pass 1 candidates which are never going to work, filter them out
+    //        instead of running pass 2 on them.
+    // Ideas for filters - too many background points assigned to tag keypoints
+
+    // TODO - simplify assigning predicted points to tag ground truth coords
+    //        do an optimal assignment pass on them?
+
+    // TODO keypoint group rewrite using cub:: 
+    // TODO - stage2_keypoint_group - verify all ids in a group are the same
+    // TODO - config values for min area, hamming distance, add more here :
+    for (size_t batchStart = 0; batchStart < rois.size(); batchStart += m_maxBatchSize)
     {
-#ifdef DEBUG
-        std::cout << "================================================" << std::endl << "iter = " << iter << std::endl;
-#endif
-        size_t retIdx = 0;
         stage2KeypointGroups.clear();
         stage2Corners.clear();
         Hs.clear();
-        const tcb::span<const std::array<cv::Point2d, 4>> thisRoiSpan{thisRois};
-        // TODO - detect pass 1 candidates which are never going to work, filter them out
-        //        instead of running pass 2 on them.
-        // Ideas for filters - too many background points assigned to tag keypoints
+        const size_t thisBatchSize = std::min(rois.size() - batchStart, m_maxBatchSize);
+        
+        std::vector<std::array<cv::Point2d, 4>> thisRois(rois.begin() + batchStart, rois.begin() + batchStart + thisBatchSize);
+        runInference(stage2KeypointGroups, stage2Corners, Hs, detectInputs, thisRois);
 
-        // TODO - simplify assigning predicted points to tag ground truth coords
-        //        do an optimal assignment pass on them?
-
-        // TODO keypoint group rewrite using cub:: 
-        // TODO - stage2_keypoint_group - verify all ids in a group are the same
-        // TODO - int8 quantization - save outputs of apriltag decoder detection and run trt on them
-        // TODO - config values for min area, hamming distance, add more here :
-        for (size_t batchStart = 0; batchStart < rois.size(); batchStart += m_maxBatchSize)
+        for (size_t ii = 0; ii < thisBatchSize; ii++)
         {
-            const size_t thisBatchSize = std::min(rois.size() - batchStart, m_maxBatchSize);
-            auto thisRoiSubspan = thisRoiSpan.subspan(batchStart, thisBatchSize);
-            runInference(stage2KeypointGroups, stage2Corners, Hs, detectInputs, thisRoiSubspan);
+            ret.push_back(std::array<DecodedTag<GRID_SIZE>, 2>{});
+            cpuPostProcess(ret[ret.size() - 1][0], stage2KeypointGroups[ii], stage2Corners[ii], Hs[ii], m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
+        } // loop over tags in batch
+    } // loop over batch in batches
 
-            for (size_t ii = 0; ii < thisRoiSubspan.size(); ii++)
+    // Iteration 2 : use the refined corners from iteration 1 to run inference
+    // Do not re-run inference on tags which failed in iteration 1
+    std::vector<std::array<cv::Point2d, 4>> thisRois;
+    size_t jj = 0;
+    while (jj < ret.size())
+    {
+        stage2KeypointGroups.clear();
+        stage2Corners.clear();
+        Hs.clear();
+        thisRois.clear();
+        // Batch up to m_maxBatchSize tags for inference, using only 
+        // tags which passed the first iteration validation
+        const size_t batchStart = jj;
+        while ((jj < ret.size()) && (thisRois.size() < m_maxBatchSize))
+        {
+            if (ret[jj][0].m_isValid)
             {
-                if (iter == 0)
+                thisRois.push_back(ret[jj][0].m_roi);
+            }
+            else
+            {
+                ret[jj][1].m_isValid = false;
+                ret[jj][1].m_tagId = -1;
+                ret[jj][1].m_HCrop = ret[jj][0].m_HCrop;
+            }
+            jj += 1;
+        }
+        // If there are any tags to process, run inference and cpu post process
+        // on them.
+        if (!thisRois.empty())
+        {
+            runInference(stage2KeypointGroups, stage2Corners, Hs, detectInputs, thisRois);
+            size_t inferenceResult = 0;
+            for (size_t ii = batchStart; (ii < jj); ii++)
+            {
+                if (ret[ii][0].m_isValid)
                 {
-                    ret.push_back(std::array<DecodedTag<GRID_SIZE>, 2>{});
+                    cpuPostProcess(ret[ii][1],
+                                   stage2KeypointGroups[inferenceResult],
+                                   stage2Corners[inferenceResult], Hs[inferenceResult],
+                                   m_gpuWorkers[thisRois.size() - 1]->getCudaStream());
+                    inferenceResult += 1;
                 }
-                ret[retIdx][iter].m_HCrop = Hs[retIdx];
-                // This will check if trust from runInference is valid?
-                ret[retIdx][iter].m_isValid = stage2KeypointGroups[retIdx].size() > 0;
-#ifdef DEBUG
-                std::cout << "iter = " << iter << " ret[" << retIdx << "][" << iter << "].m_isValid = " << ret[retIdx][iter].m_isValid << std::endl;
-#endif
-                if (ret[retIdx][iter].m_isValid)
-                {
-#ifdef DEBUG
-                    std::cout << "MatchFineGrid : ii = " << ii << " retIdx = " << retIdx << std::endl;
-#endif
-                    m_timing.start("decode_matchfinegrid", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
-                    double matchRatio;
-                    constexpr auto FINE_GRID_SIZE = MARKER_DICT::getGridSize() + 2;
-                    PointsAndIDs <FINE_GRID_SIZE> orderedFineGridPointsIds;
-                    // Assign the points detected in the crop to actual grid
-                    // points in the proposed tag. This is done by matching the
-                    // detected keypoints to the nearest grid points in the tag
-                    m_markerDict.getUnitTagTemplate().matchFineGrid(matchRatio,
-                                                                    orderedFineGridPointsIds,
-                                                                    stage2KeypointGroups[retIdx],
-                                                                    Hs[retIdx],
-                                                                    stage2Corners[retIdx],
-                                                                    m_cameraMatrix, // cameraMatrix
-                                                                    m_distCoeffs);  // distCoeffs
-                    m_timing.end("decode_matchfinegrid");
+            }
+        }
+    } // loop over all tags
 
-#ifdef DEBUG
-                    std::cout << "matchRatio = " << matchRatio << " m_minGridMatchRatio " << m_minGridMatchRatio << std::endl;
-#endif
-                    if (matchRatio > m_minGridMatchRatio)
-                    {
-                        // m_timing.start("decode_fillemptyids", m_decodeEngine->getCudaStream());
-                        //fillEmptyIds(orderedFineGridPointsIds, stage2KeypointGroups[retIdx]);
-                        // m_timing.end("decode_fillemptyids");
-
-                        m_timing.start("decode_updatecornersinimage", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
-                        const auto roiUpdated = m_markerDict.getUnitTagTemplate().updateCornersInImage(orderedFineGridPointsIds,
-                                                                                                       Hs[retIdx],
-                                                                                                       m_cameraMatrix,
-                                                                                                       m_distCoeffs);
-                        m_timing.end("decode_updatecornersinimage");
-
-                        m_timing.start("decode_getmainindex", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
-                        thisRois[retIdx] = roiUpdated;
-                        ret[retIdx][iter].m_roi = roiUpdated;
-
-                        int hammingDist = 2; // TODO - configurable, dynamic reconfig potential
-
-                        // Decode tag bits into a tagID and binaryID
-                        // Main index is the rotation of the tag (in 90* increments)
-                        m_markerDict.getMainIdx(ret[retIdx][iter].m_mainIdx,
-                                                ret[retIdx][iter].m_tagId,
-                                                ret[retIdx][iter].m_binaryId,
-                                                orderedFineGridPointsIds.m_id,
-                                                hammingDist);
-#ifdef DEBUG
-                        std::cout << "mainIdx = " << ret[retIdx][iter].m_mainIdx << " tagId = " << ret[retIdx][iter].m_tagId << std::endl;
-#endif
-                        m_timing.end("decode_getmainindex");
-
-                        m_timing.start("decode_reorderpointswithmainidx", m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
-                        m_markerDict.getUnitTagTemplate().reorderPointsWithMainIdx(ret[retIdx][iter].m_keypointsWithIds, // [re] orderedFineGridPointsIds
-                                                                                   ret[retIdx][iter].m_mainIdx,
-                                                                                   orderedFineGridPointsIds);
-                        warpPerspectivePts(ret[retIdx][iter].m_HCrop.inv(), ret[retIdx][iter].m_keypointsWithIds.m_point);
-                        m_timing.end("decode_reorderpointswithmainidx");
-#ifdef DEBUG
-                        std::cout << "orderedFineGripPointsIds" << std::endl
-                                  << orderedFineGridPointsIds << std::endl;
-                        std::cout << "ret[retIdx][iter].m_keypointsWithIds.m_point" << std::endl
-                                  << ret[retIdx][iter].m_keypointsWithIds << std::endl;
-                        for (const auto &kg : stage2KeypointGroups[retIdx])
-                        {
-                            kg.print();
-                        }
-                        for (const auto &c : stage2Corners[retIdx])
-                        {
-                            std::cout << c.x << " " << c.y << std::endl;
-                        }
-#endif
-                    }
-                    else
-                    {
-                        ret[retIdx][iter].m_isValid = false;
-                    }
-                } // if tag is valid
-                retIdx += 1;
-            } // loop over tags in batch
-        } // loop over batch in batches
-    }
     return ret;
 }
 #if 0

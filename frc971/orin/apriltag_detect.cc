@@ -713,7 +713,14 @@ static void writeStage2Debug(cv::Mat &image,
                              PointsAndIDs<GRID_SIZE + 2> keypointsAndIds,
                              std::array<cv::Point2d, 4> corners,
                              const cv::Mat &H,
-                             const uint16_t tagId) {
+                             const uint16_t tagId,
+                             const bool valid) {
+  if (!valid)
+  {
+    cv::line(image, cv::Point(0,0), cv::Point(255,255), cv::Scalar(0, 0, 255), 2);
+    cv::line(image, cv::Point(0,255), cv::Point(255,0), cv::Scalar(0, 0, 255), 2);
+    return;
+  }
   warpPerspectivePts(H, keypointsAndIds.m_point);
   for (size_t kp = 0; kp < keypointsAndIds.m_point.size(); kp++) {
     const auto id = keypointsAndIds.m_id[kp];
@@ -752,11 +759,11 @@ void visualizeStage2(cv::Mat &image, const int outputHW,
   // second on the bottom
   for (size_t i = 0; i < result.size(); i++) {
     tag = getTag(image, outputHW, result[i][0].m_HCrop);
-    writeStage2Debug<GRID_SIZE>(tag, result[i][0].m_keypointsWithIds, result[i][0].m_roi, result[i][0].m_HCrop, result[i][0].m_tagId);
+    writeStage2Debug<GRID_SIZE>(tag, result[i][0].m_keypointsWithIds, result[i][0].m_roi, result[i][0].m_HCrop, result[i][0].m_tagId, result[i][0].m_isValid);
     tag.copyTo(output(cv::Rect(i * outputHW, 0, outputHW, outputHW)));
 
     tag = getTag(image, outputHW, result[i][1].m_HCrop);
-    writeStage2Debug<GRID_SIZE>(tag, result[i][1].m_keypointsWithIds, result[i][1].m_roi, result[i][1].m_HCrop, result[i][1].m_tagId);
+    writeStage2Debug<GRID_SIZE>(tag, result[i][1].m_keypointsWithIds, result[i][1].m_roi, result[i][1].m_HCrop, result[i][1].m_tagId, result[i][1].m_isValid);
     tag.copyTo(output(cv::Rect(i * outputHW, outputHW, outputHW, outputHW)));
   }
   image = output;
@@ -850,7 +857,7 @@ void GpuDetector::DecodeTags() {
   // filtered_rois2.erase(filtered_rois2.begin(), filtered_rois2.begin() + 5);
   // filtered_rois2.erase(filtered_rois2.end());
   after_memcpy_gray_.Synchronize();
-  const auto tag_output = s_tag_decoder_.detectTags(ToGpuImage(gray_image_device_), filtered_rois2);
+  const auto tag_output = s_tag_decoder_.decodeTags(ToGpuImage(gray_image_device_), filtered_rois2);
 
 #if 1
   // Debug viz

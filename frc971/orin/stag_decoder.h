@@ -46,10 +46,11 @@ public:
                       std::vector<std::array<float2, 4>> &stage2Corners,
                       std::vector<cv::Mat> &Hs,
                       const GpuImage<uint8_t> &detectInputs,
-                      const tcb::span<const std::array<cv::Point2d, 4>> &rois);
+                      const std::vector<std::array<cv::Point2d, 4>> &rois);
 
     ushort2 getModelSize(void) const;
     cudaStream_t getCudaStream(void);
+    void setConfidence(const float confidence);
 
 private:
     Timings &m_timing;
@@ -95,7 +96,7 @@ public:
     // rois - vector of corners of tags. Tag corners are in clockwise order from tr->tl->bl->br
     // Returns 2-entry array per tag. Each array entry is 1 pass of the decode (the initial
     // followed by the one after refining corners)
-    std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> detectTags(
+    std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> decodeTags(
         const GpuImage<uint8_t> &grayImageDevice,
         const std::vector<std::array<cv::Point2d, 4>> &rois);
 
@@ -111,7 +112,13 @@ private:
                       std::vector<std::array<float2, 4>> &stage2Corners,
                       std::vector<cv::Mat> &Hs,
                       const GpuImage<uint8_t> &detectInputs,
-                      const tcb::span<const std::array<cv::Point2d, 4>> &rois);
+                      const std::vector<std::array<cv::Point2d, 4>> &rois);
+
+    void cpuPostProcess(DecodedTag<GRID_SIZE> &result, 
+                        const std::vector<Stage2KeypointGroup> &stage2KeypointGroups,
+                        const std::array<float2, 4> &stage2Corners,
+                        const cv::Mat &Hs,
+                        cudaStream_t stream);
     // void fillEmptyIds(PointsAndIDs<GRID_SIZE + 2> &orderedFineGridPointsIds,
     //                   const tcb::span<const Stage2KeypointGroup> &fineGridPointsWithIdsCandidates) const;
 
