@@ -19,7 +19,7 @@
 
 STagDecoderGPUWorker::STagDecoderGPUWorker(const std::string &modelPath,
                                            const std::string &onnxModelFilename,
-                                           const int32_t batchSize,
+                                           const size_t batchSize,
                                            Timings &timing)
     : m_timing{timing}
     , m_confidenceFilters{batchSize}
@@ -339,19 +339,28 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::cpuPostProcess(DecodedTag<GRID_SIZE> &
                                                     stage2KeypointGroups,
                                                     Hs,
                                                     stage2Corners,
-                                                    m_cameraMatrix, // cameraMatrix
-                                                    m_distCoeffs);  // distCoeffs
+                                                    m_cameraMatrix,
+                                                    m_distCoeffs);
     m_timing.end("decode_matchfinegrid");
 
+    // If too few white keypoints are assigned to the tag, there's no way it is
+    // going to decode to valid tag id.  Filter it out now
+    size_t minTagOnes;
+    size_t maxTagOnes;
+
+    m_markerDict.getMinMaxOnesCount(minTagOnes, maxTagOnes);
+    const auto ones_count = std::ranges::count_if(orderedFineGridPointsIds.m_id, [](const int i) { return i == 1; });
+    ROS_INFO_STREAM("Decoded tag ones_count = " << ones_count);
+    if (ones_count <= (minTagOnes - 2))
+    {
+        result.m_isValid = false;
+        result.m_tagId = -1;
+    }
 #ifdef DEBUG
     std::cout << "matchRatio = " << matchRatio << " m_minGridMatchRatio " << m_minGridMatchRatio << std::endl;
 #endif
     if (matchRatio > m_minGridMatchRatio)
     {
-        // m_timing.start("decode_fillemptyids", m_decodeEngine->getCudaStream());
-        //fillEmptyIds(orderedFineGridPointsIds, stage2KeypointGroups[retIdx]);
-        // m_timing.end("decode_fillemptyids");
-
         // Adjust the corners of the tag using the difference between the tag keypoints and the
         // ideal keypoints in the tag template. Use this roi as the input to the 2nd pass
         // of inference and decoding.
@@ -400,6 +409,7 @@ void STagDecoder<MARKER_DICT, GRID_SIZE>::cpuPostProcess(DecodedTag<GRID_SIZE> &
     else
     {
         result.m_isValid = false;
+        result.m_tagId = -1;
     }
 }
 
@@ -427,15 +437,12 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
     // tag template keypoints.  The tag template keypoints are the ideal
     // locations of the tag keypoints in a perfect tag detection.
 
-    // TODO - detect pass 1 candidates which are never going to work, filter them out
-    //        instead of running pass 2 on them.
     // Ideas for filters - too many background points assigned to tag keypoints
 
     // TODO - simplify assigning predicted points to tag ground truth coords
     //        do an optimal assignment pass on them?
 
     // TODO keypoint group rewrite using cub:: 
-    // TODO - stage2_keypoint_group - verify all ids in a group are the same
     // TODO - config values for min area, hamming distance, add more here :
     for (size_t batchStart = 0; batchStart < rois.size(); batchStart += m_maxBatchSize)
     {
@@ -449,8 +456,12 @@ std::vector<std::array<DecodedTag<GRID_SIZE>, 2>> STagDecoder<MARKER_DICT, GRID_
 
         for (size_t ii = 0; ii < thisBatchSize; ii++)
         {
-            ret.push_back(std::array<DecodedTag<GRID_SIZE>, 2>{});
-            cpuPostProcess(ret[ret.size() - 1][0], stage2KeypointGroups[ii], stage2Corners[ii], Hs[ii], m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
+            ret.emplace_back();
+            cpuPostProcess(ret.back()[0],
+                           stage2KeypointGroups[ii],
+                           stage2Corners[ii],
+                           Hs[ii],
+                           m_gpuWorkers[thisBatchSize - 1]->getCudaStream());
         } // loop over tags in batch
     } // loop over batch in batches
 

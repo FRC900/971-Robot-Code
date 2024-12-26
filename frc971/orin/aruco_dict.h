@@ -22,6 +22,7 @@ public:
     int getGridSize(void) const;
     std::optional<int> getDecimalId(const uint64_t tagBinaryId) const;
     const std::vector<uint64_t> &getKeys(void) const;
+    void getMinMaxOnesCount(size_t &minOnesCount, size_t &maxOnesCount) const;
 
 private:
     // Map from tag bitfield to decimal tag ID
@@ -29,6 +30,8 @@ private:
     // List of tag keys
     std::vector<uint64_t> m_tagKeys;
     int m_gridSize;
+    size_t m_minOnesCount{std::numeric_limits<size_t>::max()};
+    size_t m_maxOnesCount{0};
 };
 
 #endif

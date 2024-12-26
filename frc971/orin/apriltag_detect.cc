@@ -719,7 +719,6 @@ static void writeStage2Debug(cv::Mat &image,
   {
     cv::line(image, cv::Point(0,0), cv::Point(255,255), cv::Scalar(0, 0, 255), 2);
     cv::line(image, cv::Point(0,255), cv::Point(255,0), cv::Scalar(0, 0, 255), 2);
-    return;
   }
   warpPerspectivePts(H, keypointsAndIds.m_point);
   for (size_t kp = 0; kp < keypointsAndIds.m_point.size(); kp++) {
@@ -738,7 +737,7 @@ static void writeStage2Debug(cv::Mat &image,
              cv::Scalar(0, 255, 255), 2);
   }
   std::stringstream s;
-  s << tagId;
+  s << static_cast<int>(tagId);
   cv::putText(image, s.str(), cv::Point(5, 35), 0, 1.5, cv::Scalar(0, 255, 255),
               2);
 }

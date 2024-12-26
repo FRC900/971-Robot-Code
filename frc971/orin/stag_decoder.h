@@ -39,7 +39,7 @@ class STagDecoderGPUWorker
 public:
     STagDecoderGPUWorker(const std::string &modelPath,
                          const std::string &onnxModelFilename,
-                         const int32_t batchSize,
+                         const size_t batchSize,
                          Timings &timing);
     virtual ~STagDecoderGPUWorker() = default;
     void runInference(std::vector<std::vector<Stage2KeypointGroup>> &stage2KeypointGroups,

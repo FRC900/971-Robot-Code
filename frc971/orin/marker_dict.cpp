@@ -192,6 +192,12 @@ bool MarkerDict<GRID_SIZE, UNIT_TAG_TEMPLATE, CODEBOOK>::getMainIdx(int &mainIdx
     return false;
 }
 
+template <size_t GRID_SIZE, class UNIT_TAG_TEMPLATE, class CODEBOOK>
+void MarkerDict<GRID_SIZE, UNIT_TAG_TEMPLATE, CODEBOOK>::getMinMaxOnesCount(size_t &minOnesCount, size_t &maxOnesCount) const
+{
+    m_codebook.getMinMaxOnesCount(minOnesCount, maxOnesCount);
+}
+
 template class MarkerDict<4, UnitTagTemplateArucotag<4>, ArucoDict>;
 template class MarkerDict<5, UnitTagTemplateArucotag<5>, ArucoDict>;
 template class MarkerDict<6, UnitTagTemplateArucotag<6>, ArucoDict>;

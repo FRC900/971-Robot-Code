@@ -40,6 +40,10 @@ ArucoDict::ArucoDict(const cv::aruco::PREDEFINED_DICTIONARY_NAME dictType)
         //printf("id = %d, tagBits = %lx\n", tagIdx, tagBits);
         tagBits &= (1ULL << (m_gridSize * m_gridSize)) - 1;
 
+        const auto onesCount = std::popcount(tagBits);
+        m_minOnesCount = std::min<size_t>(m_minOnesCount, onesCount);
+        m_maxOnesCount = std::max<size_t>(m_maxOnesCount, onesCount);
+
         m_tagLookupBitmap[tagBits] = tagIdx;
         m_tagKeys.push_back(tagBits);
     }
@@ -63,4 +67,10 @@ std::optional<int> ArucoDict::getDecimalId(const uint64_t tagBinaryId) const
 const std::vector<uint64_t> &ArucoDict::getKeys(void) const
 {
     return m_tagKeys;
+}
+
+void ArucoDict::getMinMaxOnesCount(size_t &minOnesCount, size_t &maxOnesCount) const
+{
+    minOnesCount = m_minOnesCount;
+    maxOnesCount = m_maxOnesCount;
 }

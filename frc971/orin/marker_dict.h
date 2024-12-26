@@ -29,6 +29,7 @@ public:
     bool getMainIdx(int &mainIdx, int &decimalId, uint64_t &binaryId, const std::array<int, (GRID_SIZE + 2) * (GRID_SIZE + 2)> &bits, const int hammingDist) const;
 
     static constexpr size_t getGridSize(void) { return GRID_SIZE; }
+    void getMinMaxOnesCount(size_t &minOnesCount, size_t &maxOnesCount) const;
 
 private:
     const CODEBOOK m_codebook;
