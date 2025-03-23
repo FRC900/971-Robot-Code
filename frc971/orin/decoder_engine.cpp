@@ -16,11 +16,14 @@
 #include "opencv2/highgui.hpp"             // for imshow, waitKey
 #endif
 
-DecoderEngineCalibrator::DecoderEngineCalibrator(int32_t batchSize, int32_t inputW, int32_t inputH, cudaStream_t stream, const std::string &calibDataDirPath, const std::string &calibTableName, const std::string &inputBlobName,
-                                                 bool readCache)
-    : Int8EntropyCalibrator2(batchSize, inputW, inputH, stream, calibDataDirPath, calibTableName, inputBlobName, readCache)
-{
-}
+DecoderEngineCalibrator::DecoderEngineCalibrator(
+    int32_t batchSize, int32_t inputW, int32_t inputH, cudaStream_t stream,
+    const std::string &calibDataDirPath, const std::string &calibTableName,
+    const std::string &inputBlobName,
+    bool readCache)
+    : Int8EntropyCalibrator2(batchSize, inputW, inputH, stream,
+                             calibDataDirPath, calibTableName, inputBlobName,
+                             readCache) {}
 
 void DecoderEngineCalibrator::blobFromGpuImageWrappers(const std::vector<GpuImage<uint8_t>> &batchInput)
 {

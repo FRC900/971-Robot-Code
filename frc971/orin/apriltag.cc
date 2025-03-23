@@ -256,7 +256,7 @@ GpuDetector::GpuDetector(size_t width, size_t height,
   detections_ = zarray_create(sizeof(apriltag_detection_t *));
   zarray_ensure_capacity(detections_, kMaxBlobs);
 
-  s_tag_decoder_.initEngine("/home/ubuntu/900RobotCode/zebROS_ws/src/deeptag_ros/models", "apriltag_decoder_mono.onnx");
+  s_tag_decoder_.initEngine("/home/ubuntu/900RobotCode/zebROS_ws/src/gpu_apriltag/models", "arucotag_decoder.onnx");
 }
 
 GpuDetector::~GpuDetector() {

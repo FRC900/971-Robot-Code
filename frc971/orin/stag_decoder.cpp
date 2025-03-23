@@ -19,7 +19,7 @@
 
 STagDecoderGPUWorker::STagDecoderGPUWorker(const std::string &modelPath,
                                            const std::string &onnxModelFilename,
-                                           const size_t batchSize,
+                                           const int32_t batchSize,
                                            Timings &timing)
     : m_timing{timing}
     , m_confidenceFilters{batchSize}

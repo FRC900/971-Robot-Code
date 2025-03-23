@@ -29,22 +29,12 @@ std::vector<std::string> Util::getFilesInDirectory(const std::string& dirPath) {
     return filepaths;
 }
 
-void Logger::log(Severity severity, const char *msg) noexcept {
-    // Would advise using a proper logging utility such as https://github.com/gabime/spdlog
-    // For the sake of this tutorial, will just log to the console.
-
-    // Only log Warnings or more important.
-    if (severity <= Severity::kWARNING) {
-        std::cout << msg << std::endl;
-    }
-}
-
 template<class CALIBRATOR>
 Engine<CALIBRATOR>::Engine(const Options &options)
     : m_options(options)
+    , m_timings(std::make_unique<Timings>())
 {
     cudaSafeCall(cudaStreamCreate(&m_inferenceCudaStream));
-    m_timings = std::make_unique<Timings>();
     m_timings->setEnabled(false);
 }
 
@@ -56,7 +46,7 @@ bool Engine<CALIBRATOR>::build(const std::string &modelPath, const std::string &
     std::cout << "Searching for engine file with name: " << m_engineName << std::endl;
 
     if (doesFileExist(m_engineName)) {
-        std::cout << "Engine found, not regenerating..." << std::endl;
+        std::cout << "\tEngine found, not regenerating..." << std::endl;
         return true;
     }
 
@@ -118,9 +108,9 @@ bool Engine<CALIBRATOR>::build(const std::string &modelPath, const std::string &
 
     // Check to see if the model supports dynamic batch size or not
     if (input0Batch == -1) {
-        std::cout << "Model supports dynamic batch size" << std::endl;
+        std::cout << "\tModel supports dynamic batch size" << std::endl;
     } else if (input0Batch == 1) {
-        std::cout << "Model only supports fixed batch size of 1" << std::endl;
+        std::cout << "\tModel only supports fixed batch size of 1" << std::endl;
         // If the model supports a fixed batch size, ensure that the maxBatchSize and optBatchSize were set correctly.
         if (m_options.optBatchSize != input0Batch || m_options.maxBatchSize != input0Batch) {
             throw std::runtime_error("Error, model only supports a fixed batch size of 1. Must set Options.optBatchSize and Options.maxBatchSize to 1");
@@ -146,10 +136,10 @@ bool Engine<CALIBRATOR>::build(const std::string &modelPath, const std::string &
         int32_t inputH = inputDims.d[2];
         int32_t inputW = inputDims.d[3];
 
-        // Specify the optimization profile`
-        optProfile->setDimensions(inputName, OptProfileSelector::kMIN, Dims4(1, inputC, inputH, inputW));
+        // Specify the optimization profile
+        optProfile->setDimensions(inputName, OptProfileSelector::kMIN, Dims4(m_options.optBatchSize, inputC, inputH, inputW));
         optProfile->setDimensions(inputName, OptProfileSelector::kOPT, Dims4(m_options.optBatchSize, inputC, inputH, inputW));
-        optProfile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4(m_options.maxBatchSize, inputC, inputH, inputW));
+        optProfile->setDimensions(inputName, OptProfileSelector::kMAX, Dims4(m_options.optBatchSize, inputC, inputH, inputW));
     }
     config->addOptimizationProfile(optProfile);
 
@@ -205,7 +195,7 @@ bool Engine<CALIBRATOR>::build(const std::string &modelPath, const std::string &
     std::ofstream outfile(m_engineName, std::ofstream::binary);
     outfile.write(reinterpret_cast<const char*>(plan->data()), plan->size());
 
-    std::cout << "Success, saved engine to " << m_engineName << std::endl;
+    std::cout << "\tSuccess, saved engine to " << m_engineName << std::endl;
 
     cudaSafeCall(cudaStreamDestroy(profileStream));
     return true;
@@ -269,7 +259,7 @@ bool Engine<CALIBRATOR>::loadNetwork() {
         const auto tensorName = m_engine->getIOTensorName(i);
         const auto tensorType = m_engine->getTensorIOMode(tensorName);
         const auto tensorShape = m_engine->getTensorShape(tensorName);
-        std::cout << "tensorName = " << tensorName << " tensorShape = " << tensorShape.d[0] << ", " << tensorShape.d[1] << ", " << tensorShape.d[2] << ", " << tensorShape.d[3] << std::endl;
+        std::cout << "\ttensorName = " << tensorName << " tensorShape = " << tensorShape.d[0] << ", " << tensorShape.d[1] << ", " << tensorShape.d[2] << ", " << tensorShape.d[3] << std::endl;
         if (tensorType == TensorIOMode::kINPUT) {
             m_inputDims.push_back(tensorShape);
             m_inputTensorNames.emplace_back(tensorName);
@@ -549,6 +539,7 @@ void Engine<CALIBRATOR>::getDeviceNames(std::vector<std::string>& deviceNames) c
     }
 }
 
+#if 0
 template<class CALIBRATOR>
 void Engine<CALIBRATOR>::transformOutput(std::vector<std::vector<std::vector<float>>>& input, std::vector<std::vector<float>>& output) {
     if (input.size() != 1) {
@@ -566,6 +557,7 @@ void Engine<CALIBRATOR>::transformOutput(std::vector<std::vector<std::vector<flo
 
     output = std::move(input[0][0]);
 }
+#endif
 
 template<class CALIBRATOR>
 const float *Engine<CALIBRATOR>::getBufferByName(const std::string &name, const size_t index) const{
@@ -646,6 +638,7 @@ Int8EntropyCalibrator2::Int8EntropyCalibrator2(int32_t batchSize, int32_t inputW
         throw std::runtime_error("Error, directory at provided path does not exist: " + calibDataDirPath);
     }
 
+    #if 0
     m_imgPaths = getFilesInDirectory(calibDataDirPath);
     if (m_imgPaths.size() < static_cast<size_t>(batchSize)) {
         throw std::runtime_error("There are fewer calibration images than the specified batch size!");
@@ -655,6 +648,7 @@ Int8EntropyCalibrator2::Int8EntropyCalibrator2(int32_t batchSize, int32_t inputW
     auto rd = std::random_device {};
     auto rng = std::default_random_engine { rd() };
     std::shuffle(std::begin(m_imgPaths), std::end(m_imgPaths), rng);
+    #endif
 }
 
 int32_t Int8EntropyCalibrator2::getBatchSize() const noexcept {
@@ -664,6 +658,7 @@ int32_t Int8EntropyCalibrator2::getBatchSize() const noexcept {
 
 bool Int8EntropyCalibrator2::getBatch(void **bindings, const char **names, int32_t nbBindings) noexcept {
     // This method will read a batch of images into GPU memory, and place the pointer to the GPU memory in the bindings variable.
+    throw std::runtime_error("Error, getBatch() not implemented!");
 
 #if 0 // TODO - fix me
     if (m_imgIdx + m_batchSize > static_cast<int>(m_imgPaths.size())) {
@@ -703,12 +698,12 @@ bool Int8EntropyCalibrator2::getBatch(void **bindings, const char **names, int32
 }
 
 void const *Int8EntropyCalibrator2::readCalibrationCache(size_t &length) noexcept {
-    std::cout << "Searching for calibration cache: " << m_calibTableName << std::endl;
+    std::cout << "\tSearching for calibration cache: " << m_calibTableName << std::endl;
     m_calibCache.clear();
     std::ifstream input(m_calibTableName, std::ios::binary);
     input >> std::noskipws;
     if (m_readCache && input.good()) {
-        std::cout << "Reading calibration cache: " << m_calibTableName << std::endl;
+        std::cout << "\tReading calibration cache: " << m_calibTableName << std::endl;
         std::copy(std::istream_iterator<char>(input), std::istream_iterator<char>(), std::back_inserter(m_calibCache));
     }
     length = m_calibCache.size();
@@ -716,7 +711,7 @@ void const *Int8EntropyCalibrator2::readCalibrationCache(size_t &length) noexcep
 }
 
 void Int8EntropyCalibrator2::writeCalibrationCache(const void *ptr, std::size_t length) noexcept {
-    std::cout << "Writing calib cache: " << m_calibTableName << " Size: " << length << " bytes" << std::endl;
+    std::cout << "\tWriting calib cache: " << m_calibTableName << " Size: " << length << " bytes" << std::endl;
     std::ofstream output(m_calibTableName, std::ios::binary);
     output.write(reinterpret_cast<const char*>(ptr), length);
 }
