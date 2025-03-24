@@ -8,13 +8,12 @@
 
 #include <cstdio>
 #include <iostream>
+#include <vector>
 #include "frc971/orin/cuda_utils.h"
 #include "frc971/orin/suppress_and_average_keypoints.h"
 
-template <class INPUT, class OUTPUT>
-__global__ void computeGroupMembership(OUTPUT *groups,
-                                       uint32_t *groupCount,
-                                       bool *scratch,
+template <class INPUT>
+__global__ void computeGroupMembership(bool *groupMatrix,
                                        const INPUT *input,
                                        const uint32_t inputCount,
                                        const float sigma,
@@ -28,12 +27,10 @@ __global__ void computeGroupMembership(OUTPUT *groups,
     }
     // Only need one diagonal of the matrix calculated
     // It is symmetrical, but also the other diagonal isn't ever referenced
-    #if 1
     if (y < x)
     {
         return;
     }
-    #endif
 
     bool result = true;
     //printf ("x = %d, y = %d, index = %d\n ", x, y, x * inputCount + y);
@@ -43,58 +40,26 @@ __global__ void computeGroupMembership(OUTPUT *groups,
     }
 
     //printf ("x = %d, y = %d, index = %d, result = %d, sigma = %f, min_cos = %f\n", x, y, x * inputCount + y, result, sigma, min_cos);
-    scratch[x * inputCount + y] = result;
-
-    __syncthreads();
-
-    if ((x == 0) && (y == 0))
-    {
-        // Keep track of which indexes have already been added
-        // to a group. The next one not added is the index of
-        // a start of a new group.
-        bool *used = &scratch[inputCount * inputCount];
-        for (int32_t i = 0; i < inputCount; i++)
-        {
-            used[i] = false;
-        }
-        *groupCount = 0;
-        for (int32_t i = 0; i < inputCount; i++)
-        {
-            // Starting with the next first unused index
-            // group together all of the indexes that are 
-            // in the same group as that first index
-            if (!used[i])
-            {
-                groups[*groupCount].reset();
-                for (int32_t j = i; j < inputCount; j++)
-                {
-                    if (scratch[i * inputCount + j])
-                    {
-                        groups[*groupCount].append(input[j]);
-                        used[j] = true;
-                    }
-                }
-                groups[*groupCount].end();
-                *groupCount += 1;
-            }
-        }
-    }
+    groupMatrix[x * inputCount + y] = result;
 }
 
 template <class INPUT, class OUTPUT>
 SuppressAndAverageKeypoints<INPUT, OUTPUT>::SuppressAndAverageKeypoints()
 {
-    cudaSafeCall(cudaMallocHost(&m_hOutputLengthPtr, sizeof(*m_hOutputLengthPtr)));
-    cudaSafeCall(cudaMalloc(&m_dOutputLengthPtr, sizeof(*m_dOutputLengthPtr)));
+    cudaSafeCall(cudaEventCreate(&m_hostInputReadyEvent));
     cudaSafeCall(cudaEventCreate(&m_outputReadyEvent));
+    cudaSafeCall(cudaStreamCreate(&m_hostMemcpyStream));
 }
 
 template <class INPUT, class OUTPUT>
 SuppressAndAverageKeypoints<INPUT, OUTPUT>::~SuppressAndAverageKeypoints()
 {
-    cudaSafeCall(cudaFreeHost(m_hOutputLengthPtr));
-    cudaSafeCall(cudaFree(m_dOutput));
+    cudaSafeCall(cudaFreeHost(m_hInput));
     cudaSafeCall(cudaFree(m_dGroupMatrix));
+    cudaSafeCall(cudaFreeHost(m_hGroupMatrix));
+    cudaSafeCall(cudaEventDestroy(m_hostInputReadyEvent));
+    cudaSafeCall(cudaEventDestroy(m_outputReadyEvent));
+    cudaSafeCall(cudaStreamDestroy(m_hostMemcpyStream));
 }
 
 template <class INPUT, class OUTPUT>
@@ -104,60 +69,84 @@ void SuppressAndAverageKeypoints<INPUT, OUTPUT>::compute(const tcb::span<const I
                                                          cudaStream_t cudaStream)
 {
     constexpr int32_t blockSize = 8;
-    if (input.size() > m_inputCount)
+
+    // Reallocate buffers if needed to fit the new input size
+    if (input.size() > m_allocatedInputSize)
     {
-        cudaSafeCall(cudaFreeAsync(m_dOutput, cudaStream));
-        cudaSafeCall(cudaFreeAsync(m_dGroupMatrix, cudaStream));
-        cudaSafeCall(cudaFreeHost(m_hOutput));
-        cudaSafeCall(cudaMallocAsync(&m_dOutput, sizeof(OUTPUT) * input.size(), cudaStream));
-        // This wil not call the contstructor for each OUTPUT entry,
-        // but we don't really care - the data only gets set from
-        // a memcpy from the device anyway
-        cudaSafeCall(cudaMallocHost(&m_hOutput, sizeof(OUTPUT) * input.size()));
+        cudaSafeCall(cudaFreeHost(m_hInput));
+        cudaSafeCall(cudaMallocHost(&m_hInput, sizeof(INPUT) * input.size()));
+
         // Allocate an nxn grid to mark same/not-same group from input i to input j.
-        // Add a final row to use in combining groups together
-        cudaSafeCall(cudaMallocAsync(&m_dGroupMatrix, sizeof(bool) * (input.size() + 1) * input.size(), cudaStream));
-        m_inputCount = input.size();
+        cudaSafeCall(cudaFreeAsync(m_dGroupMatrix, cudaStream));
+        cudaSafeCall(cudaMallocAsync(&m_dGroupMatrix, sizeof(bool) * input.size() * input.size(), cudaStream));
+
+        // And the corresponding buffer on the host side
+        cudaSafeCall(cudaFreeHost(m_hGroupMatrix));
+        cudaSafeCall(cudaMallocHost(&m_hGroupMatrix, sizeof(bool) * input.size() * input.size()));
+        m_allocatedInputSize = input.size();
 
     }
+    m_thisInputSize = input.size();
     if (input.size() > 0)
     {
+        // Copy input to host for later use in group merging
+        cudaSafeCall(cudaMemcpyAsync(m_hInput, input.data(), sizeof(INPUT) * input.size(), cudaMemcpyDeviceToHost, m_hostMemcpyStream));
+        cudaSafeCall(cudaEventRecord(m_hostInputReadyEvent, m_hostMemcpyStream));
+
+        // Compute group membership on GPU - this checks each pair of inputs to see
+        // if they are similar enough to be in the same group
         const dim3 blockDim(blockSize, blockSize);
         const dim3 gridDim(iDivUp(input.size(), blockDim.x), iDivUp(input.size(), blockDim.y));
-        computeGroupMembership<INPUT, OUTPUT><<<gridDim, blockDim, 0, cudaStream>>>(m_dOutput, m_dOutputLengthPtr, m_dGroupMatrix, input.data(), input.size(), sigma, min_cos);
+        computeGroupMembership<INPUT><<<gridDim, blockDim, 0, cudaStream>>>(m_dGroupMatrix, input.data(), input.size(), sigma, min_cos);
         cudaSafeCall(cudaGetLastError());
-        cudaSafeCall(cudaMemcpyAsync(m_hOutputLengthPtr, m_dOutputLengthPtr, sizeof(*m_hOutputLengthPtr), cudaMemcpyDeviceToHost, cudaStream));
-        // inputCount is small enough that it seems quicker to unconditionally queue this up here
-        // rather than wait for output count to get back to the host and then queue up a shorter sized copy
-        cudaSafeCall(cudaMemcpyAsync(m_hOutput, m_dOutput, input.size() * sizeof(OUTPUT), cudaMemcpyDeviceToHost, cudaStream));
+        cudaSafeCall(cudaMemcpyAsync(m_hGroupMatrix, m_dGroupMatrix, sizeof(bool) * input.size() * input.size(), cudaMemcpyDeviceToHost, cudaStream));
     }
     else
     {
-        *m_hOutputLengthPtr = 0;
+        cudaSafeCall(cudaEventRecord(m_hostInputReadyEvent, m_hostMemcpyStream));
     }
     cudaSafeCall(cudaEventRecord(m_outputReadyEvent, cudaStream));
-
-#if 0
-    bool *hGroupMatrix = new bool[inputCount * inputCount];
-    cudaSafeCall(cudaMemcpyAsync(hGroupMatrix, m_dGroupMatrix, sizeof(bool) * inputCount * inputCount, cudaMemcpyDeviceToHost, cudaStream));
-    cudaSafeCall(cudaStreamSynchronize(cudaStream));
-    for (int r = 0; r < inputCount; r++)
-    {
-        for (int c = 0; c < inputCount; c++)
-        {
-            std::cout << hGroupMatrix[r * inputCount + c] << " ";
-        }
-        std::cout << std::endl;
-    }
-#endif
 }
 
 template <class INPUT, class OUTPUT>
 const tcb::span<const OUTPUT> SuppressAndAverageKeypoints<INPUT, OUTPUT>::getOutput()
 {
-    cudaSafeCall(cudaEventSynchronize(m_outputReadyEvent));
+    if (m_thisInputSize == 0)
+    {
+        return tcb::span<const OUTPUT>();
+    }
 
-    return tcb::span<const OUTPUT>(m_hOutput, *m_hOutputLengthPtr);
+    std::vector<bool> used(m_thisInputSize, false);
+    m_output.clear();
+
+    cudaSafeCall(cudaEventSynchronize(m_hostInputReadyEvent));
+    cudaSafeCall(cudaEventSynchronize(m_outputReadyEvent));
+    // Do group merging here on CPU
+
+    // Keep track of which indexes have already been added
+    // to a group. The next one not added is the index of
+    // a start of a new group.
+    for (int32_t i = 0; i < m_thisInputSize; i++)
+    {
+        // Starting with the next first unused index
+        // group together all of the indexes that are 
+        // in the same group as that first index
+        if (!used[i])
+        {
+            m_output.emplace_back();
+            for (int32_t j = i; j < m_thisInputSize; j++)
+            {
+                if (m_hGroupMatrix[i * m_thisInputSize + j])
+                {
+                    m_output.back().append(m_hInput[j]);
+                    used[j] = true;
+                }
+            }
+            m_output.back().end();
+        }
+    }
+
+    return tcb::span<const OUTPUT>(m_output);
 }
 
 // #include "deeptag_ros/stage1_grid.h"

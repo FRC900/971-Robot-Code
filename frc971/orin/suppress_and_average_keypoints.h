@@ -1,6 +1,7 @@
 #ifndef SUPPRESS_AND_AVERAGE_KEYPOINTS_H__
 #define SUPPRESS_AND_AVERAGE_KEYPOINTS_H__
 
+#include <vector>
 #include "gpu_apriltag/span.hpp"
 
 template <class INPUT, class OUTPUT>
@@ -23,13 +24,16 @@ public:
     const tcb::span<const OUTPUT> getOutput();
 
 private:
-    OUTPUT   *m_dOutput{nullptr};
-    OUTPUT   *m_hOutput{nullptr};
+    INPUT    *m_hInput{nullptr};
+    std::vector<OUTPUT> m_output;
     bool     *m_dGroupMatrix{nullptr};
-    uint32_t  m_inputCount{0};
-    uint32_t *m_dOutputLengthPtr{nullptr};
-    uint32_t *m_hOutputLengthPtr{nullptr};
+    bool     *m_hGroupMatrix{nullptr};
+    uint32_t  m_allocatedInputSize{0};
+    uint32_t  m_thisInputSize{0};
+
+    cudaEvent_t m_hostInputReadyEvent;
     cudaEvent_t m_outputReadyEvent;
+    cudaStream_t m_hostMemcpyStream;
 };
 
 #endif
