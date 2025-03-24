@@ -29,6 +29,16 @@ std::vector<std::string> Util::getFilesInDirectory(const std::string& dirPath) {
     return filepaths;
 }
 
+void Logger::log(Severity severity, const char *msg) noexcept {
+    // Would advise using a proper logging utility such as https://github.com/gabime/spdlog
+    // For the sake of this tutorial, will just log to the console.
+
+    // Only log Warnings or more important.
+    if (severity <= Severity::kWARNING) {
+        std::cout << msg << std::endl;
+    }
+}
+
 template<class CALIBRATOR>
 Engine<CALIBRATOR>::Engine(const Options &options)
     : m_options(options)
@@ -539,7 +549,6 @@ void Engine<CALIBRATOR>::getDeviceNames(std::vector<std::string>& deviceNames) c
     }
 }
 
-#if 0
 template<class CALIBRATOR>
 void Engine<CALIBRATOR>::transformOutput(std::vector<std::vector<std::vector<float>>>& input, std::vector<std::vector<float>>& output) {
     if (input.size() != 1) {
@@ -557,7 +566,6 @@ void Engine<CALIBRATOR>::transformOutput(std::vector<std::vector<std::vector<flo
 
     output = std::move(input[0][0]);
 }
-#endif
 
 template<class CALIBRATOR>
 const float *Engine<CALIBRATOR>::getBufferByName(const std::string &name, const size_t index) const{
